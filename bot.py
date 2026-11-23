@@ -1,5 +1,7 @@
 import asyncio
 import hashlib
+import hmac
+import secrets
 import json
 import logging
 import os
@@ -7,6 +9,8 @@ import re
 import sqlite3
 from contextlib import closing
 from html import escape as h
+from acts import generate_act_pdf
+from devices_catalog import search_devices
 from repair import match_work_price, search_parts_all
 from typing import Optional
 
@@ -25,6 +29,7 @@ from aiogram.types import (
     InputMediaPhoto,
     Message,
     MessageEntity,
+    BufferedInputFile,
     TelegramObject,
     WebAppInfo,
 )
@@ -180,6 +185,8 @@ def init_db() -> None:
                 can_post INTEGER NOT NULL DEFAULT 1,
                 can_personal_ledger INTEGER NOT NULL DEFAULT 0,
                 can_repair INTEGER NOT NULL DEFAULT 0,
+                can_parts_search INTEGER NOT NULL DEFAULT 0,
+                can_repair_crm INTEGER NOT NULL DEFAULT 0,
                 web_password_hash TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -242,11 +249,20 @@ def init_db() -> None:
             """
             CREATE TABLE IF NOT EXISTS repair_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+                client_name TEXT NOT NULL DEFAULT '',
+                client_phone TEXT NOT NULL DEFAULT '',
                 device_model TEXT NOT NULL,
+                imei_sn TEXT NOT NULL DEFAULT '',
+                issue_desc TEXT NOT NULL DEFAULT '',
+                appearance TEXT NOT NULL DEFAULT '',
+                completeness TEXT NOT NULL DEFAULT '',
+                passcode_note TEXT NOT NULL DEFAULT '',
                 service_name TEXT NOT NULL DEFAULT '',
                 client_info TEXT NOT NULL DEFAULT '',
                 part_cost REAL NOT NULL DEFAULT 0,
+                prepayment REAL NOT NULL DEFAULT 0,
                 total_price REAL NOT NULL DEFAULT 0,
+                warranty_days INTEGER NOT NULL DEFAULT 30,
                 status TEXT NOT NULL DEFAULT 'in_work',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 done_at TIMESTAMP DEFAULT NULL
@@ -282,6 +298,33 @@ def init_db() -> None:
             conn.execute("ALTER TABLE admins ADD COLUMN web_password_hash TEXT DEFAULT ''")
         if "can_repair" not in admin_cols:
             conn.execute("ALTER TABLE admins ADD COLUMN can_repair INTEGER NOT NULL DEFAULT 0")
+        if "can_parts_search" not in admin_cols:
+            conn.execute("ALTER TABLE admins ADD COLUMN can_parts_search INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE admins SET can_parts_search = can_repair WHERE can_repair = 1")
+        if "can_repair_crm" not in admin_cols:
+            conn.execute("ALTER TABLE admins ADD COLUMN can_repair_crm INTEGER NOT NULL DEFAULT 0")
+            conn.execute("UPDATE admins SET can_repair_crm = can_repair WHERE can_repair = 1")
+
+        ro_cols = {r[1] for r in conn.execute("PRAGMA table_info(repair_orders)").fetchall()}
+        for col, ddl in [
+            ("client_name", "TEXT NOT NULL DEFAULT ''"),
+            ("client_phone", "TEXT NOT NULL DEFAULT ''"),
+            ("imei_sn", "TEXT NOT NULL DEFAULT ''"),
+            ("issue_desc", "TEXT NOT NULL DEFAULT ''"),
+            ("appearance", "TEXT NOT NULL DEFAULT ''"),
+            ("completeness", "TEXT NOT NULL DEFAULT ''"),
+            ("passcode_note", "TEXT NOT NULL DEFAULT ''"),
+            ("prepayment", "REAL NOT NULL DEFAULT 0"),
+            ("warranty_days", "INTEGER NOT NULL DEFAULT 30"),
+        ]:
+            if col not in ro_cols:
+                conn.execute(f"ALTER TABLE repair_orders ADD COLUMN {col} {ddl}")
+
+        if not conn.execute("SELECT value FROM settings WHERE key = 'web_secret'").fetchone():
+            conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('web_secret', ?)",
+                (secrets.token_hex(32),),
+            )
 
         ship_cols = {r[1] for r in conn.execute("PRAGMA table_info(shipments)").fetchall()}
         if "delivery_cost" not in ship_cols:
@@ -395,7 +438,7 @@ def is_admin(user_id: int) -> bool:
 
 def has_perm(user_id: int, perm: str) -> bool:
     if is_owner(user_id):
-        return perm in ("can_crm", "can_post", "can_finances", "can_repair")
+        return perm in ("can_crm", "can_post", "can_finances", "can_parts_search", "can_repair_crm")
     rec = get_admin_record(user_id)
     if not rec:
         return False
@@ -417,7 +460,7 @@ def add_admin(target_user_id: int, label: str) -> None:
 
 
 def toggle_admin_perm(admin_row_id: int, perm: str) -> None:
-    if perm not in ("can_crm", "can_post", "can_personal_ledger", "can_repair"):
+    if perm not in ("can_crm", "can_post", "can_personal_ledger", "can_parts_search", "can_repair_crm"):
         return
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute(
@@ -878,16 +921,56 @@ def get_repair_orders() -> list[sqlite3.Row]:
         return conn.execute("SELECT * FROM repair_orders ORDER BY id DESC LIMIT 40").fetchall()
 
 
+def get_repair_order_by_id(order_id: int) -> Optional[sqlite3.Row]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM repair_orders WHERE id = ?", (order_id,)).fetchone()
+
+
 def add_repair_order(
-    device_model: str, service_name: str, client_info: str, part_cost: float, total_price: float
+    device_model: str,
+    service_name: str,
+    client_info: str,
+    part_cost: float,
+    total_price: float,
+    client_name: str = "",
+    client_phone: str = "",
+    imei_sn: str = "",
+    issue_desc: str = "",
+    appearance: str = "",
+    completeness: str = "",
+    passcode_note: str = "",
+    prepayment: float = 0.0,
+    warranty_days: int = 30,
 ) -> int:
+    cname = client_name.strip() or client_info.strip()
+    cinfo = f"{cname} {client_phone.strip()}".strip()
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
             """
-            INSERT INTO repair_orders (device_model, service_name, client_info, part_cost, total_price, status)
-            VALUES (?, ?, ?, ?, ?, 'in_work')
+            INSERT INTO repair_orders (
+                client_name, client_phone, device_model, imei_sn, issue_desc,
+                appearance, completeness, passcode_note, service_name, client_info,
+                part_cost, prepayment, total_price, warranty_days, status
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'in_work')
             """,
-            (device_model.strip(), service_name.strip(), client_info.strip(), part_cost, total_price),
+            (
+                cname,
+                client_phone.strip(),
+                device_model.strip(),
+                imei_sn.strip(),
+                issue_desc.strip(),
+                appearance.strip(),
+                completeness.strip(),
+                passcode_note.strip(),
+                service_name.strip(),
+                cinfo,
+                part_cost,
+                prepayment,
+                total_price,
+                warranty_days,
+            ),
         )
         conn.commit()
         return cur.lastrowid
@@ -959,10 +1042,18 @@ class RepairFSM(StatesGroup):
     waiting_new_price_keywords = State()
     waiting_new_price_amount = State()
     waiting_edit_price_amount = State()
+    waiting_order_client_name = State()
+    waiting_order_client_phone = State()
     waiting_order_device = State()
-    waiting_order_client = State()
+    waiting_order_imei = State()
+    waiting_order_issue = State()
+    waiting_order_appearance = State()
+    waiting_order_completeness = State()
+    waiting_order_passcode = State()
     waiting_order_part_cost = State()
+    waiting_order_prepay = State()
     waiting_order_total = State()
+    waiting_order_warranty = State()
 
 
 class PersonalFSM(StatesGroup):
@@ -984,8 +1075,10 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📦 CRM", callback_data="crm_menu")])
     if has_perm(user_id, "can_post"):
         rows.append([InlineKeyboardButton(text="📝 Создать/Редактировать пост", callback_data="posts_menu")])
-    if has_perm(user_id, "can_repair"):
-        rows.append([InlineKeyboardButton(text="🔧 Ремонт", callback_data="repair_menu")])
+    if has_perm(user_id, "can_parts_search"):
+        rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
+    if has_perm(user_id, "can_repair_crm"):
+        rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
     if has_perm(user_id, "can_personal_ledger"):
         rows.append([InlineKeyboardButton(text="💼 Мой учёт", callback_data="personal_menu")])
     if WEB_URL:
@@ -1069,12 +1162,14 @@ def admin_config_kb(adm: sqlite3.Row) -> InlineKeyboardMarkup:
     crm_flag = "✅" if adm["can_crm"] else "❌"
     post_flag = "✅" if adm["can_post"] else "❌"
     pers_flag = "✅" if adm["can_personal_ledger"] else "❌"
-    rep_flag = "✅" if ("can_repair" in adm.keys() and adm["can_repair"]) else "❌"
+    parts_flag = "✅" if ("can_parts_search" in adm.keys() and adm["can_parts_search"]) else "❌"
+    repcrm_flag = "✅" if ("can_repair_crm" in adm.keys() and adm["can_repair_crm"]) else "❌"
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=f"{crm_flag} Общая CRM (треки и отправки)", callback_data=f"tperm:{adm['id']}:can_crm")],
             [InlineKeyboardButton(text=f"{post_flag} Постинг в канал", callback_data=f"tperm:{adm['id']}:can_post")],
-            [InlineKeyboardButton(text=f"{rep_flag} Ремонт (поиск и цены работы)", callback_data=f"tperm:{adm['id']}:can_repair")],
+            [InlineKeyboardButton(text=f"{parts_flag} Поиск запчастей и прайс работы", callback_data=f"tperm:{adm['id']}:can_parts_search")],
+            [InlineKeyboardButton(text=f"{repcrm_flag} СРМ Ремонт (клиенты и акты)", callback_data=f"tperm:{adm['id']}:can_repair_crm")],
             [InlineKeyboardButton(text=f"{pers_flag} Свой личный учёт (заход/продажа)", callback_data=f"tperm:{adm['id']}:can_personal_ledger")],
             [InlineKeyboardButton(text="🗑 Удалить админа", callback_data=f"del_admin:{adm['id']}")],
             [InlineKeyboardButton(text="⬅️ Назад к списку", callback_data="admins_menu")],
@@ -1563,43 +1658,66 @@ async def cb_pers_stats(callback: CallbackQuery) -> None:
 
 
 # ===========================================================================
-# РАЗДЕЛ 3: РЕМОНТ (ПОИСК ЗАПЧАСТЕЙ + ПРАЙС РАБОТЫ + ЗАКАЗЫ)
+# РАЗДЕЛ 3: ПОИСК ЗАПЧАСТЕЙ И СРМ РЕМОНТ (РАЗДЕЛЬНЫЕ ВКЛАДКИ И ПРАВА)
 # ===========================================================================
 
-def repair_menu_kb() -> InlineKeyboardMarkup:
+def parts_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🔍 Найти запчасть (MM / Moba / MEMS)", callback_data="rep_search")],
             [InlineKeyboardButton(text="💰 Прайс за нашу работу", callback_data="rep_prices")],
-            [InlineKeyboardButton(text="📋 Заказы в ремонте", callback_data="rep_orders")],
             [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
         ]
     )
 
 
-@router.callback_query(F.data == "repair_menu")
-async def cb_repair_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
-        await callback.answer("Нет доступа к разделу Ремонт", show_alert=True)
+def repair_crm_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Принять устройство в ремонт", callback_data="rep_new_order")],
+            [InlineKeyboardButton(text="📋 Заказы в ремонте и акты", callback_data="rep_orders")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "parts_menu")
+async def cb_parts_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not has_perm(callback.from_user.id, "can_parts_search"):
+        await callback.answer("Нет доступа к поиску запчастей", show_alert=True)
         return
     await state.clear()
     await callback.message.edit_text(
-        "🔧 <b>Ремонт и поиск запчастей (Москва)</b>\n"
-        "Поиск сразу по <b>Master Mobile</b>, <b>Moba</b> и <b>MEMS</b> + автоматический расчёт цены с вашей работой:",
-        reply_markup=repair_menu_kb(),
+        "🔍 <b>Поиск запчастей (Москва)</b>\n"
+        "Поиск по <b>Master Mobile</b>, <b>Moba</b> и <b>MEMS</b> + расчёт цены с вашей работой:",
+        reply_markup=parts_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "repair_crm_menu")
+async def cb_repair_crm_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        await callback.answer("Нет доступа к СРМ Ремонт", show_alert=True)
+        return
+    await state.clear()
+    await callback.message.edit_text(
+        "🛠 <b>СРМ Ремонт (Qhead Mobile)</b>\n"
+        "Запись клиентов, учёт ремонтов и автоматические PDF-акты приёма и выдачи:",
+        reply_markup=repair_crm_kb(),
     )
     await callback.answer()
 
 
 @router.callback_query(F.data == "rep_search")
 async def cb_rep_search(callback: CallbackQuery, state: FSMContext) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_parts_search"):
         return
     await state.set_state(RepairFSM.waiting_search_query)
     await callback.message.edit_text(
         "🔍 Напишите, что ищем (например: <i>экран 11 айфон</i> или <i>акб iphone 13</i>):",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="repair_menu")]]
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="parts_menu")]]
         ),
     )
     await callback.answer()
@@ -1607,7 +1725,7 @@ async def cb_rep_search(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(RepairFSM.waiting_search_query, F.text)
 async def msg_rep_search(message: Message, state: FSMContext) -> None:
-    if not has_perm(message.from_user.id, "can_repair"):
+    if not has_perm(message.from_user.id, "can_parts_search"):
         return
     query = message.text.strip()
     wait_msg = await message.answer("⏳ Ищу запчасти на Master Mobile, Moba и MEMS...")
@@ -1617,13 +1735,15 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
     work_title, work_price = match_work_price(query, prices)
 
     lines = [
-        f"🔍 Результаты по запросу: <b>{h(query)}</b>",
+        f"🔍 Результаты по запросу: <b>{h(query)}</b> (<i>{h(res['normalized_query'])}</i>)",
         f"🛠 Работа ({h(work_title)}): <b>{fmt_money(work_price)}</b>\n",
     ]
     for site_name, items in res["groups"].items():
         lines.append(f"🏬 <b>{site_name}</b>")
         if not items:
-            lines.append("<i>Карточки не найдены — откройте поиск напрямую по кнопке ниже.</i>")
+            st = res.get("statuses", {}).get(site_name, 0)
+            note = f" (HTTP {st})" if st and st != 200 else ""
+            lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
         else:
             for it in items[:4]:
                 total = it["price"] + work_price
@@ -1644,7 +1764,7 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
                 InlineKeyboardButton(text="MEMS", url=urls["mems"]),
             ],
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
-            [InlineKeyboardButton(text="🔧 В меню ремонта", callback_data="repair_menu")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
         ]
     )
     await state.clear()
@@ -1653,7 +1773,7 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "rep_prices")
 async def cb_rep_prices(callback: CallbackQuery) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_parts_search"):
         return
     prices = get_repair_prices()
     rows = [
@@ -1661,7 +1781,7 @@ async def cb_rep_prices(callback: CallbackQuery) -> None:
         for r in prices
     ]
     rows.append([InlineKeyboardButton(text="➕ Добавить позицию прайса", callback_data="rep_add_p")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")])
     await callback.message.edit_text(
         "💰 <b>Прайс за нашу работу</b>\nНажмите на строку, чтобы изменить цену:",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
@@ -1671,7 +1791,7 @@ async def cb_rep_prices(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data.startswith("rep_edit_p:"))
 async def cb_rep_edit_p(callback: CallbackQuery, state: FSMContext) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_parts_search"):
         return
     pid = int(callback.data.split(":")[1])
     await state.set_state(RepairFSM.waiting_edit_price_amount)
@@ -1690,7 +1810,7 @@ async def cb_rep_edit_p(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("rep_del_p:"))
 async def cb_rep_del_p(callback: CallbackQuery, state: FSMContext) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_parts_search"):
         return
     pid = int(callback.data.split(":")[1])
     delete_repair_price(pid)
@@ -1706,13 +1826,13 @@ async def msg_rep_edit_p(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Цена работы обновлена: <b>{fmt_money(val)}</b>",
-        reply_markup=repair_menu_kb(),
+        reply_markup=parts_menu_kb(),
     )
 
 
 @router.callback_query(F.data == "rep_add_p")
 async def cb_rep_add_p(callback: CallbackQuery, state: FSMContext) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_parts_search"):
         return
     await state.set_state(RepairFSM.waiting_new_price_title)
     await callback.message.edit_text("📝 Название услуги (например: <i>Замена экрана iPhone 14 Pro</i>):")
@@ -1741,76 +1861,239 @@ async def msg_rep_new_p_amt(message: Message, state: FSMContext) -> None:
     await state.clear()
     await message.answer(
         f"✅ Добавлено в прайс: <b>{h(data['title'])}</b> — {fmt_money(val)}",
-        reply_markup=repair_menu_kb(),
+        reply_markup=parts_menu_kb(),
     )
 
 
+# --- СРМ Ремонт: заказы и PDF-акты ---
+
 @router.callback_query(F.data == "rep_orders")
 async def cb_rep_orders(callback: CallbackQuery) -> None:
-    if not has_perm(callback.from_user.id, "can_repair"):
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     orders = get_repair_orders()
-    lines = ["📋 <b>Заказы на ремонт</b>\n"]
-    rows = [[InlineKeyboardButton(text="➕ Записать в ремонт", callback_data="rep_new_order")]]
+    lines = ["📋 <b>Заказы СРМ Ремонт</b>\n"]
+    rows = [[InlineKeyboardButton(text="➕ Принять устройство", callback_data="rep_new_order")]]
     if not orders:
         lines.append("<i>Заказов пока нет.</i>")
     else:
         for o in orders[:10]:
-            st = "✅ Готов" if o["status"] == "done" else "🛠 В работе"
-            lines.append(f"• <b>{h(o['device_model'])}</b> ({h(o['client_info'] or '—')}) — {fmt_money(o['total_price'])} [{st}]")
+            st = "✅ Выдан" if o["status"] == "done" else "🛠 В работе"
+            num = str(o["id"]).zfill(4)
+            lines.append(f"• <b>№{num} {h(o['device_model'])}</b> ({h(o['client_name'] or o['client_info'])}) — {fmt_money(o['total_price'])} [{st}]")
             if o["status"] == "in_work":
-                rows.append([InlineKeyboardButton(text=f"✅ Завершить: {o['device_model'][:20]}", callback_data=f"rep_done:{o['id']}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_menu")])
+                rows.append([InlineKeyboardButton(text=f"✅ Закрыть №{num} + Акт работ", callback_data=f"rep_done:{o['id']}")])
+            else:
+                rows.append([InlineKeyboardButton(text=f"📄 Акт работ №{num}", callback_data=f"rep_pdf_done:{o['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_crm_menu")])
     await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
 @router.callback_query(F.data == "rep_new_order")
 async def cb_rep_new_order(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(RepairFSM.waiting_order_device)
-    await callback.message.edit_text("📱 Модель телефона и что меняем (например: <i>iPhone 11, экран</i>):")
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
+    await state.set_state(RepairFSM.waiting_order_client_name)
+    await callback.message.edit_text(
+        "👤 Введите <b>Имя клиента</b>:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="repair_crm_menu")]]
+        ),
+    )
     await callback.answer()
 
 
+@router.message(RepairFSM.waiting_order_client_name, F.text)
+async def msg_rep_cname(message: Message, state: FSMContext) -> None:
+    await state.update_data(client_name=message.text.strip())
+    await state.set_state(RepairFSM.waiting_order_client_phone)
+    await message.answer("📞 Введите <b>номер телефона клиента</b>:")
+
+
+@router.message(RepairFSM.waiting_order_client_phone, F.text)
+async def msg_rep_cphone(message: Message, state: FSMContext) -> None:
+    await state.update_data(client_phone=message.text.strip())
+    await state.set_state(RepairFSM.waiting_order_device)
+    await message.answer("📱 Устройство / Модель (например: <i>Apple iPhone 13 128GB</i>):")
+
+
 @router.message(RepairFSM.waiting_order_device, F.text)
-async def msg_rep_order_dev(message: Message, state: FSMContext) -> None:
-    await state.update_data(device_model=message.text.strip())
-    await state.set_state(RepairFSM.waiting_order_client)
-    await message.answer("👤 Имя и телефон клиента:")
+async def msg_rep_odev(message: Message, state: FSMContext) -> None:
+    raw = message.text.strip()
+    matches = search_devices(raw, limit=6)
+    # Если точное совпадение одно или пользователь ввёл подробное название — сразу идём дальше
+    if not matches or (len(matches) == 1 and matches[0].lower() == raw.lower()) or len(raw) > 22:
+        await state.update_data(device_model=raw)
+        await state.set_state(RepairFSM.waiting_order_imei)
+        await message.answer("🔢 IMEI или серийный номер (или <code>-</code>, чтобы пропустить):")
+        return
+    await state.update_data(device_candidates=matches, raw_device=raw)
+    rows = [[InlineKeyboardButton(text=m, callback_data=f"rep_pick_dev:{idx}")] for idx, m in enumerate(matches)]
+    rows.append([InlineKeyboardButton(text=f"Оставить: {raw[:24]}", callback_data="rep_pick_dev:raw")])
+    await message.answer(
+        "📱 Выберите точную модель из справочника (или оставьте как написали):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
 
 
-@router.message(RepairFSM.waiting_order_client, F.text)
-async def msg_rep_order_cli(message: Message, state: FSMContext) -> None:
-    await state.update_data(client_info=message.text.strip())
+@router.callback_query(RepairFSM.waiting_order_device, F.data.startswith("rep_pick_dev:"))
+async def cb_rep_pick_dev(callback: CallbackQuery, state: FSMContext) -> None:
+    choice = callback.data.split(":")[1]
+    data = await state.get_data()
+    if choice == "raw":
+        model = data.get("raw_device", "")
+    else:
+        cands = data.get("device_candidates", [])
+        idx = int(choice)
+        model = cands[idx] if 0 <= idx < len(cands) else data.get("raw_device", "")
+    await state.update_data(device_model=model)
+    await state.set_state(RepairFSM.waiting_order_imei)
+    await callback.message.edit_text(f"📱 Выбрано: <b>{h(model)}</b>\n\n🔢 IMEI или серийный номер (или <code>-</code>, чтобы пропустить):")
+    await callback.answer()
+
+
+@router.message(RepairFSM.waiting_order_imei, F.text)
+async def msg_rep_oimei(message: Message, state: FSMContext) -> None:
+    val = "" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(imei_sn=val)
+    await state.set_state(RepairFSM.waiting_order_issue)
+    await message.answer("🛠 Неисправность / что нужно сделать:")
+
+
+@router.message(RepairFSM.waiting_order_issue, F.text)
+async def msg_rep_oissue(message: Message, state: FSMContext) -> None:
+    await state.update_data(issue_desc=message.text.strip())
+    await state.set_state(RepairFSM.waiting_order_appearance)
+    await message.answer("👀 Внешний вид (например: <i>Потёртости, сколы</i> или <code>-</code>):")
+
+
+@router.message(RepairFSM.waiting_order_appearance, F.text)
+async def msg_rep_oapp(message: Message, state: FSMContext) -> None:
+    val = "Б/у, следы эксплуатации" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(appearance=val)
+    await state.set_state(RepairFSM.waiting_order_completeness)
+    await message.answer("📦 Комплектация (например: <i>Только устройство</i> или <code>-</code>):")
+
+
+@router.message(RepairFSM.waiting_order_completeness, F.text)
+async def msg_rep_ocomp(message: Message, state: FSMContext) -> None:
+    val = "Только устройство" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(completeness=val)
+    await state.set_state(RepairFSM.waiting_order_passcode)
+    await message.answer("🔐 Пароль от устройства / примечание (или <code>-</code>):")
+
+
+@router.message(RepairFSM.waiting_order_passcode, F.text)
+async def msg_rep_opass(message: Message, state: FSMContext) -> None:
+    val = "—" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(passcode_note=val)
     await state.set_state(RepairFSM.waiting_order_part_cost)
-    await message.answer("🔩 Цена запчасти (₽):")
+    await message.answer("🔩 Себестоимость запчасти (₽, или <code>0</code>):")
 
 
 @router.message(RepairFSM.waiting_order_part_cost, F.text)
-async def msg_rep_order_pcost(message: Message, state: FSMContext) -> None:
+async def msg_rep_opcost(message: Message, state: FSMContext) -> None:
     await state.update_data(part_cost=parse_amount(message.text))
+    await state.set_state(RepairFSM.waiting_order_prepay)
+    await message.answer("💳 Предоплата от клиента (₽, или <code>0</code>):")
+
+
+@router.message(RepairFSM.waiting_order_prepay, F.text)
+async def msg_rep_oprep(message: Message, state: FSMContext) -> None:
+    await state.update_data(prepayment=parse_amount(message.text))
     await state.set_state(RepairFSM.waiting_order_total)
-    await message.answer("💵 Итоговая цена для клиента (запчасть + работа, ₽):")
+    await message.answer("💵 Ориентировочная итоговая цена для клиента (₽):")
 
 
 @router.message(RepairFSM.waiting_order_total, F.text)
-async def msg_rep_order_tot(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    tot = parse_amount(message.text)
-    add_repair_order(data["device_model"], "", data["client_info"], data["part_cost"], tot)
-    await state.clear()
+async def msg_rep_otot(message: Message, state: FSMContext) -> None:
+    await state.update_data(total_price=parse_amount(message.text))
+    await state.set_state(RepairFSM.waiting_order_warranty)
     await message.answer(
-        f"✅ Заказ записан: <b>{h(data['device_model'])}</b> — {fmt_money(tot)}",
-        reply_markup=repair_menu_kb(),
+        "🛡 Укажите <b>срок гарантии в днях</b> (например: <code>30</code>, <code>90</code> или <code>0</code>):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="30 дней (стандарт)", callback_data="rep_warr:30")],
+                [InlineKeyboardButton(text="90 дней", callback_data="rep_warr:90")],
+                [InlineKeyboardButton(text="Без гарантии (0)", callback_data="rep_warr:0")],
+            ]
+        ),
     )
+
+
+async def _finalize_repair_order(target, state: FSMContext, warranty_days: int) -> None:
+    data = await state.get_data()
+    oid = add_repair_order(
+        device_model=data["device_model"],
+        service_name=data["issue_desc"],
+        client_info=data["client_name"],
+        part_cost=data["part_cost"],
+        total_price=data["total_price"],
+        client_name=data["client_name"],
+        client_phone=data["client_phone"],
+        imei_sn=data["imei_sn"],
+        issue_desc=data["issue_desc"],
+        appearance=data["appearance"],
+        completeness=data["completeness"],
+        passcode_note=data["passcode_note"],
+        prepayment=data["prepayment"],
+        warranty_days=warranty_days,
+    )
+    await state.clear()
+    order = dict(get_repair_order_by_id(oid))
+    pdf_bytes = generate_act_pdf(order, "intake")
+    num = str(oid).zfill(4)
+    msg_obj = target.message if isinstance(target, CallbackQuery) else target
+    await msg_obj.answer_document(
+        BufferedInputFile(pdf_bytes, filename=f"Akt_Priema_{num}.pdf"),
+        caption=f"✅ Заказ <b>№{num}</b> принят в работу (гарантия: {warranty_days} дн.)!\nАкт приёма сформирован.",
+        reply_markup=repair_crm_kb(),
+    )
+
+
+@router.callback_query(RepairFSM.waiting_order_warranty, F.data.startswith("rep_warr:"))
+async def cb_rep_warr(callback: CallbackQuery, state: FSMContext) -> None:
+    days = int(callback.data.split(":")[1])
+    await _finalize_repair_order(callback, state, days)
+    await callback.answer()
+
+
+@router.message(RepairFSM.waiting_order_warranty, F.text)
+async def msg_rep_warr(message: Message, state: FSMContext) -> None:
+    days = int(parse_amount(message.text))
+    await _finalize_repair_order(message, state, max(0, days))
 
 
 @router.callback_query(F.data.startswith("rep_done:"))
 async def cb_rep_done(callback: CallbackQuery) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
     oid = int(callback.data.split(":")[1])
     mark_repair_done(oid)
-    await callback.answer("Заказ завершён!")
-    await cb_rep_orders(callback)
+    order = dict(get_repair_order_by_id(oid))
+    pdf_bytes = generate_act_pdf(order, "done")
+    num = str(oid).zfill(4)
+    await callback.message.answer_document(
+        BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
+        caption=f"✅ Ремонт <b>№{num}</b> закрыт! Вот акт выполненных работ.",
+        reply_markup=repair_crm_kb(),
+    )
+    await callback.answer("Готово!")
+
+
+@router.callback_query(F.data.startswith("rep_pdf_done:"))
+async def cb_rep_pdf_done(callback: CallbackQuery) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
+    oid = int(callback.data.split(":")[1])
+    order = dict(get_repair_order_by_id(oid))
+    pdf_bytes = generate_act_pdf(order, "done")
+    num = str(oid).zfill(4)
+    await callback.message.answer_document(
+        BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
+    )
+    await callback.answer()
 
 
 # ===========================================================================
@@ -2874,6 +3157,9 @@ async def main() -> None:
         "get_owner_hash": get_owner_hash,
         "find_admin_by_web_password": find_admin_by_web_password,
         "get_admin_by_hash": get_admin_by_hash,
+        "get_setting": get_setting,
+        "get_repair_order_by_id": get_repair_order_by_id,
+        "generate_act_pdf": generate_act_pdf,
         "get_repair_prices": get_repair_prices,
         "add_repair_price": add_repair_price,
         "update_repair_price": update_repair_price,
