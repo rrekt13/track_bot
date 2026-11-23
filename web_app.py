@@ -434,6 +434,27 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="postsList" class="posts-grid"></div>
     </section>
 
+    <!-- РЕМОНТ И ПОИСК ЗАПЧАСТЕЙ -->
+    <section id="view-repair" style="display:none">
+      <div class="toolbar">
+        <input class="search" id="repQuery" placeholder="Поиск запчастей (напр. экран 11 айфон)..." onkeydown="if(event.key==='Enter') runRepairSearch()">
+        <button class="btn btn-orange" id="repSearchBtn" onclick="runRepairSearch()">🔍 Найти</button>
+      </div>
+      <div id="repResults" style="margin-bottom:18px"></div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0">
+        <div class="sec-title" style="margin:0">💰 Прайс за нашу работу</div>
+        <button class="btn btn-dark btn-sm" onclick="openNewRepPrice()">+ Услуга</button>
+      </div>
+      <div id="repPricesList" class="kpi-grid" style="margin-bottom:18px"></div>
+
+      <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0">
+        <div class="sec-title" style="margin:0">📋 Заказы в ремонте</div>
+        <button class="btn btn-orange btn-sm" onclick="openNewRepOrder()">+ В ремонт</button>
+      </div>
+      <div id="repOrdersList" class="posts-grid"></div>
+    </section>
+
     <!-- АРХИВ -->
     <section id="view-archive" style="display:none">
       <div class="toolbar">
@@ -448,6 +469,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <button class="dock-btn" data-tab="crm" onclick="switchTab('crm')"><span class="d-ico">📦</span>CRM</button>
     <button class="dock-btn" data-tab="direct" onclick="switchTab('direct')"><span class="d-ico">🏷</span>Свои</button>
     <button class="dock-btn" data-tab="posts" onclick="switchTab('posts')"><span class="d-ico">📝</span>Посты</button>
+    <button class="dock-btn" data-tab="repair" onclick="switchTab('repair')"><span class="d-ico">🔧</span>Ремонт</button>
     <button class="dock-btn" data-tab="archive" onclick="switchTab('archive')"><span class="d-ico">🗄</span>Архив</button>
   </nav>
 
@@ -459,7 +481,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <script>
 __FALL_JS__
 
-let STATE = { role: 'owner', finances: {}, shipments: [], posts: [], direct_items: [], unsold_my: [] };
+let STATE = { role: 'owner', finances: {}, shipments: [], posts: [], direct_items: [], unsold_my: [], repair_prices: [], repair_orders: [] };
 let CURRENT_TAB = 'home';
 
 function esc(s) {
@@ -483,7 +505,7 @@ function copyText(txt) {
 function switchTab(tab) {
   CURRENT_TAB = tab;
   document.querySelectorAll('.dock-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  ['home','crm','direct','posts','archive'].forEach(t => {
+  ['home','crm','direct','posts','repair','archive'].forEach(t => {
     document.getElementById('view-' + t).style.display = (t === tab) ? '' : 'none';
   });
   document.getElementById('bgFall').style.opacity = (tab === 'home') ? '1' : '0.25';
@@ -517,6 +539,7 @@ function render() {
     if (t === 'crm' || t === 'archive') show = !!perms.can_crm;
     if (t === 'posts') show = !!perms.can_post;
     if (t === 'direct') show = !!perms.can_personal_ledger;
+    if (t === 'repair') show = !!perms.can_repair;
     b.style.display = show ? '' : 'none';
   });
 
@@ -525,6 +548,7 @@ function render() {
   if (CURRENT_TAB === 'archive') renderShipments('archived', 'archList', 'archSearch');
   if (CURRENT_TAB === 'direct') renderDirect();
   if (CURRENT_TAB === 'posts') renderPosts();
+  if (CURRENT_TAB === 'repair') renderRepair();
 }
 
 function renderHome(isAdmin, perms) {
@@ -535,6 +559,7 @@ function renderHome(isAdmin, perms) {
     const crmCard = perms.can_crm ? `<button class="quick-btn" onclick="switchTab('crm')"><span class="ico">📦</span>CRM Треки</button>` : '';
     const postCard = perms.can_post ? `<button class="quick-btn" onclick="switchTab('posts')"><span class="ico">📝</span>Посты</button>` : '';
     const dirCard = perms.can_personal_ledger ? `<button class="quick-btn" onclick="openNewDirect()"><span class="ico">➕</span>Свой товар</button>` : '';
+    const repCard = perms.can_repair ? `<button class="quick-btn" onclick="switchTab('repair')"><span class="ico">🔧</span>Ремонт</button>` : '';
     const finHero = perms.can_personal_ledger ? `
       <div class="hero-card">
         <div class="hero-row">
@@ -559,6 +584,7 @@ function renderHome(isAdmin, perms) {
         ${crmCard}
         ${postCard}
         ${dirCard}
+        ${repCard}
       </div>
     `;
     return;
@@ -921,6 +947,169 @@ async function submitNewPost() {
   requestAnimationFrame(frame);
 })();
 
+
+let LAST_REPAIR_SEARCH = null;
+
+async function runRepairSearch() {
+  const q = document.getElementById('repQuery').value.trim();
+  if (!q) return;
+  const btn = document.getElementById('repSearchBtn');
+  btn.disabled = true; btn.textContent = 'Ищу...';
+  try {
+    LAST_REPAIR_SEARCH = await api('/api/repair/search?q=' + encodeURIComponent(q));
+    renderRepairSearch();
+  } catch (e) {
+    toast(e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = '🔍 Найти';
+  }
+}
+
+function renderRepairSearch() {
+  const el = document.getElementById('repResults');
+  if (!LAST_REPAIR_SEARCH) { el.innerHTML = ''; return; }
+  const { work_title, work_price, groups, search_urls } = LAST_REPAIR_SEARCH;
+  let html = `<div class="badge badge-active" style="margin-bottom:10px;display:inline-block">🛠 Работа (${esc(work_title)}): ${fmtMoney(work_price)}</div>`;
+  for (const [site, items] of Object.entries(groups || {})) {
+    const searchUrl = site === 'Master Mobile' ? search_urls.master_mobile : (site === 'Moba' ? search_urls.moba : search_urls.mems);
+    html += `<div class="ship-card" style="margin-bottom:10px"><div class="ship-head"><div class="ship-title">🏬 ${esc(site)}</div><a href="${esc(searchUrl)}" target="_blank" class="btn btn-dark btn-sm" style="text-decoration:none">Открыть поиск ↗</a></div><div class="items-grid">`;
+    if (!items.length) {
+      html += `<div style="padding:10px;color:var(--muted);font-size:12px">Карточки не распарсились — нажмите «Открыть поиск ↗».</div>`;
+    } else {
+      for (const it of items) {
+        const total = Number(it.price || 0) + Number(work_price || 0);
+        html += `
+          <div class="micro-card">
+            <div>
+              <div class="micro-name"><a href="${esc(it.url)}" target="_blank" style="color:#fff;text-decoration:none">${esc(it.title)} ↗</a></div>
+              <div style="margin:6px 0;display:flex;gap:6px;flex-wrap:wrap">
+                <span class="badge badge-active">${esc(it.quality)}</span>
+                <span class="badge ${it.in_stock?'badge-sold':'badge-arch'}">${it.in_stock?'В наличии':'Уточнить'}</span>
+              </div>
+              <div style="font-size:11px;color:var(--muted)">Запчасть: ${fmtMoney(it.price)} + Работа: ${fmtMoney(work_price)}</div>
+              <div style="font-size:16px;font-weight:800;color:var(--green);margin-top:4px">Итого: ${fmtMoney(total)}</div>
+            </div>
+            <div class="micro-actions" style="margin-top:6px">
+              <button class="btn btn-orange btn-sm" onclick="openNewRepOrder('${esc(LAST_REPAIR_SEARCH.query)}', ${it.price}, ${total})">➕ В ремонт</button>
+            </div>
+          </div>`;
+      }
+    }
+    html += `</div></div>`;
+  }
+  el.innerHTML = html;
+}
+
+function renderRepair() {
+  renderRepairSearch();
+  const plist = document.getElementById('repPricesList');
+  const prices = STATE.repair_prices || [];
+  plist.innerHTML = prices.map(pr => `
+    <div class="kpi" style="cursor:pointer" onclick="openEditRepPrice(${pr.id}, '${esc(pr.title)}', ${pr.work_price})">
+      <div class="kpi-label">${esc(pr.title)}</div>
+      <div class="kpi-val orange">${fmtMoney(pr.work_price)} <span style="font-size:12px;color:var(--muted)">✏️</span></div>
+    </div>
+  `).join('');
+
+  const olist = document.getElementById('repOrdersList');
+  const orders = STATE.repair_orders || [];
+  if (!orders.length) {
+    olist.innerHTML = `<div class="empty">Заказов в ремонте пока нет</div>`;
+    return;
+  }
+  olist.innerHTML = orders.map(o => {
+    const doneBadge = o.status === 'done'
+      ? `<span class="badge badge-sold">Готов • +${fmtMoney((o.total_price||0)-(o.part_cost||0))}</span>`
+      : `<button class="btn btn-green btn-sm" onclick="markRepDone(${o.id})">✅ Готов</button>`;
+    return `
+      <div class="post-card">
+        <div>
+          <div class="post-head">
+            <div class="post-title">${esc(o.device_model)}</div>
+            <span class="post-price">${fmtMoney(o.total_price)}</span>
+          </div>
+          <div class="meta-row" style="margin-top:6px">Клиент: ${esc(o.client_info || '—')} • Запчасть: ${fmtMoney(o.part_cost)}</div>
+        </div>
+        <div class="post-foot">
+          ${doneBadge}
+          <button class="btn btn-red btn-sm" onclick="delRepOrder(${o.id})">🗑</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function openEditRepPrice(id, title, price) {
+  openModal(`
+    <h3>✏️ Изменить цену работы</h3>
+    <p style="font-size:13px;color:var(--muted);margin-top:0">${esc(title)}</p>
+    <div class="field"><label>Цена за работу (₽)</label><input id="rpVal" value="${price}"></div>
+    <div class="modal-btns">
+      <button class="btn btn-red" onclick="delRepPrice(${id})">Удалить</button>
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitEditRepPrice(${id})">Сохранить</button>
+    </div>
+  `);
+}
+async function submitEditRepPrice(id) {
+  await api('/api/repair/prices/' + id, 'PUT', { work_price: document.getElementById('rpVal').value });
+  closeModal(); toast('Цена обновлена'); loadAll();
+}
+async function delRepPrice(id) {
+  await api('/api/repair/prices/' + id, 'DELETE');
+  closeModal(); toast('Удалено'); loadAll();
+}
+function openNewRepPrice() {
+  openModal(`
+    <h3>➕ Новая позиция прайса</h3>
+    <div class="field"><label>Название услуги</label><input id="nrpTitle" placeholder="Замена экрана iPhone 14 Pro"></div>
+    <div class="field"><label>Ключевые слова (через запятую)</label><input id="nrpKw" placeholder="экран,дисплей,14 pro"></div>
+    <div class="field"><label>Цена за работу (₽)</label><input id="nrpPrice" placeholder="3500"></div>
+    <div class="modal-btns">
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitNewRepPrice()">Добавить</button>
+    </div>
+  `);
+}
+async function submitNewRepPrice() {
+  const title = document.getElementById('nrpTitle').value.trim();
+  const keywords = document.getElementById('nrpKw').value.trim();
+  const work_price = document.getElementById('nrpPrice').value.trim();
+  if (!title) return;
+  await api('/api/repair/prices', 'POST', { title, keywords, work_price });
+  closeModal(); toast('Добавлено'); loadAll();
+}
+function openNewRepOrder(dev='', pcost=0, tot=0) {
+  openModal(`
+    <h3>📋 Записать в ремонт</h3>
+    <div class="field"><label>Модель и услуга</label><input id="roDev" value="${esc(dev)}" placeholder="iPhone 11, замена экрана"></div>
+    <div class="field"><label>Клиент (имя / телефон)</label><input id="roCli" placeholder="Алексей +7999..."></div>
+    <div class="field"><label>Цена запчасти (₽)</label><input id="roPart" value="${pcost || ''}" placeholder="2100"></div>
+    <div class="field"><label>Итоговая цена клиенту (₽)</label><input id="roTot" value="${tot || ''}" placeholder="4600"></div>
+    <div class="modal-btns">
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitNewRepOrder()">Сохранить</button>
+    </div>
+  `);
+}
+async function submitNewRepOrder() {
+  const device_model = document.getElementById('roDev').value.trim();
+  const client_info = document.getElementById('roCli').value.trim();
+  const part_cost = document.getElementById('roPart').value.trim();
+  const total_price = document.getElementById('roTot').value.trim();
+  if (!device_model) return;
+  await api('/api/repair/orders', 'POST', { device_model, client_info, part_cost, total_price });
+  closeModal(); toast('Заказ добавлен'); loadAll();
+}
+async function markRepDone(id) {
+  await api('/api/repair/orders/' + id + '/done', 'POST');
+  toast('Заказ завершён!'); loadAll();
+}
+async function delRepOrder(id) {
+  if (!confirm('Удалить заказ?')) return;
+  await api('/api/repair/orders/' + id, 'DELETE');
+  toast('Удалено'); loadAll();
+}
+
 loadAll();
   } catch (e) {
     toast(e.message); btn.disabled = false; btn.textContent = '✅ Добавить КУПИТЬ✅ и выложить';
@@ -1204,6 +1393,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 "can_crm": bool(adm["can_crm"]) if adm else False,
                 "can_post": bool(adm["can_post"]) if adm else False,
                 "can_personal_ledger": bool(adm["can_personal_ledger"]) if adm else False,
+                "can_repair": bool(adm["can_repair"]) if (adm and "can_repair" in adm.keys()) else False,
             }
             finances = deps["get_personal_stats_by_hash"](uhash) if perms["can_personal_ledger"] else {}
 
@@ -1241,6 +1431,8 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 "posts": posts,
                 "direct_items": direct_items,
                 "unsold_my": [],
+                "repair_prices": [dict(r) for r in deps["get_repair_prices"]()] if perms["can_repair"] else [],
+                "repair_orders": [dict(o) for o in deps["get_repair_orders"]()] if perms["can_repair"] else [],
             })
 
         finances = deps["get_crm_finances"]()
@@ -1267,12 +1459,14 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 direct_items.append(d)
         return web.json_response({
             "role": "owner",
-            "perms": {"can_crm": True, "can_post": True, "can_personal_ledger": True},
+            "perms": {"can_crm": True, "can_post": True, "can_personal_ledger": True, "can_repair": True},
             "finances": finances,
             "shipments": all_ships,
             "posts": posts,
             "direct_items": direct_items,
             "unsold_my": unsold_my[:25],
+            "repair_prices": [dict(r) for r in deps["get_repair_prices"]()],
+            "repair_orders": [dict(o) for o in deps["get_repair_orders"]()],
         })
 
     async def handle_create_post(request: web.Request) -> web.Response:
@@ -1472,6 +1666,77 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
             return web.Response(status=404)
         return web.FileResponse(fpath)
 
+
+    def _has_repair_perm(request: web.Request) -> bool:
+        sess = request["session"]
+        if sess["role"] == "owner":
+            return True
+        adm = deps["get_admin_by_hash"](sess["user_hash"])
+        return bool(adm and "can_repair" in adm.keys() and adm["can_repair"])
+
+    async def handle_repair_search(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        q = request.query.get("q", "").strip()
+        if not q:
+            return web.json_response({"error": "Введите запрос"}, status=400)
+        res = await deps["search_parts_all"](q)
+        prices = [dict(r) for r in deps["get_repair_prices"]()]
+        w_title, w_price = deps["match_work_price"](q, prices)
+        res["work_title"] = w_title
+        res["work_price"] = w_price
+        return web.json_response(res)
+
+    async def handle_add_rep_price(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        body = await request.json()
+        pid = deps["add_repair_price"](
+            str(body.get("title", "")),
+            str(body.get("keywords", "")),
+            deps["parse_amount"](str(body.get("work_price", "0"))),
+        )
+        return web.json_response({"id": pid})
+
+    async def handle_upd_rep_price(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        pid = int(request.match_info["id"])
+        body = await request.json()
+        deps["update_repair_price"](pid, deps["parse_amount"](str(body.get("work_price", "0"))))
+        return web.json_response({"ok": True})
+
+    async def handle_del_rep_price(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["delete_repair_price"](int(request.match_info["id"]))
+        return web.json_response({"ok": True})
+
+    async def handle_add_rep_order(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        body = await request.json()
+        oid = deps["add_repair_order"](
+            str(body.get("device_model", "")),
+            "",
+            str(body.get("client_info", "")),
+            deps["parse_amount"](str(body.get("part_cost", "0"))),
+            deps["parse_amount"](str(body.get("total_price", "0"))),
+        )
+        return web.json_response({"id": oid})
+
+    async def handle_done_rep_order(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["mark_repair_done"](int(request.match_info["id"]))
+        return web.json_response({"ok": True})
+
+    async def handle_del_rep_order(request: web.Request) -> web.Response:
+        if not _has_repair_perm(request):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["delete_repair_order"](int(request.match_info["id"]))
+        return web.json_response({"ok": True})
+
     app.router.add_get("/health", handle_health)
     app.router.add_get("/logout", handle_logout)
     app.router.add_get("/login", handle_login_get)
@@ -1490,6 +1755,13 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/api/direct/{id}/sell", handle_sell_direct)
     app.router.add_delete("/api/direct/{id}", handle_delete_direct)
     app.router.add_get("/api/photo/{name}", handle_get_photo)
+    app.router.add_get("/api/repair/search", handle_repair_search)
+    app.router.add_post("/api/repair/prices", handle_add_rep_price)
+    app.router.add_put("/api/repair/prices/{id}", handle_upd_rep_price)
+    app.router.add_delete("/api/repair/prices/{id}", handle_del_rep_price)
+    app.router.add_post("/api/repair/orders", handle_add_rep_order)
+    app.router.add_post("/api/repair/orders/{id}/done", handle_done_rep_order)
+    app.router.add_delete("/api/repair/orders/{id}", handle_del_rep_order)
     return app
 
 
