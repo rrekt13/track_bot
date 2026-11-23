@@ -615,8 +615,12 @@ async function api(url, method='GET', body=null) {
   const opts = { method, headers: {'Content-Type': 'application/json'} };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Ошибка запроса');
+  const raw = await res.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {
+    throw new Error(res.ok ? 'Ошибка ответа сервера' : ('HTTP ' + res.status));
+  }
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
 
@@ -631,7 +635,8 @@ async function loadAll() {
 
 function render() {
   const isOwner = STATE.role === 'owner';
-  const perms = STATE.perms || { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
+  const hasPerms = STATE.perms && Object.keys(STATE.perms).length > 0;
+  const perms = hasPerms ? STATE.perms : { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
   document.querySelectorAll('.dock-btn').forEach(b => {
     const t = b.dataset.tab;
     let show = true;

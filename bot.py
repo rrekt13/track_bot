@@ -582,10 +582,10 @@ def get_shipments(status: str = "active", user_hash: Optional[str] = None) -> li
         if user_hash:
             return conn.execute(
                 """
-                SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.name, '') AS creator_name
+                SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
                 FROM shipments s
                 LEFT JOIN items i ON i.shipment_id = s.id
-                LEFT JOIN admins a ON a.user_id = s.user_id
+                LEFT JOIN admins a ON a.user_hash = s.user_id
                 WHERE s.status = ? AND s.user_id = ?
                 GROUP BY s.id
                 ORDER BY s.id DESC
@@ -594,10 +594,10 @@ def get_shipments(status: str = "active", user_hash: Optional[str] = None) -> li
             ).fetchall()
         return conn.execute(
             """
-            SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.name, '') AS creator_name
+            SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
             FROM shipments s
             LEFT JOIN items i ON i.shipment_id = s.id
-            LEFT JOIN admins a ON a.user_id = s.user_id
+            LEFT JOIN admins a ON a.user_hash = s.user_id
             WHERE s.status = ?
             GROUP BY s.id
             ORDER BY s.id DESC
