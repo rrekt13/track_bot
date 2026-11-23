@@ -2490,6 +2490,8 @@ async def main() -> None:
         "delete_personal_entry_by_hash": delete_personal_entry_by_hash,
         "get_shipments": get_shipments,
         "get_items": get_items,
+        "get_setting": get_setting,
+        "save_post": save_post,
         "get_all_posts": get_all_posts,
         "get_post_by_id": get_post_by_id,
         "create_shipment": create_shipment,

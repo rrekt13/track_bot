@@ -3,18 +3,39 @@ import base64
 import hashlib
 import logging
 import os
+import uuid
 from typing import Any, Callable, Optional
 
 from aiohttp import web
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+)
 
 logger = logging.getLogger(__name__)
 
 WEB_PORT = int(os.getenv("PORT", os.getenv("WEB_PORT", "8080")))
 WEB_PASSWORD = os.getenv("WEB_PASSWORD", "").strip()
 COOKIE_NAME = "qcrm_auth"
+
+# Встроенный сжатый логотип QHEAD Mobile
+_DEFAULT_LOGO_B64 = "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"
+
+
+def _get_logo_html() -> str:
+    for fname in ("logo.png", "logo.jpg", "logo.jpeg"):
+        if os.path.isfile(fname):
+            ext = fname.rsplit(".", 1)[-1]
+            with open(fname, "rb") as f:
+                b64 = base64.b64encode(f.read()).decode("ascii")
+            return f'<img src="data:image/{ext};base64,{b64}" alt="QCRM" class="logo-img">'
+    if _DEFAULT_LOGO_B64:
+        return f'<img src="data:image/jpeg;base64,{_DEFAULT_LOGO_B64}" alt="QCRM" class="logo-img">'
+    return '<div class="logo-fallback">Q</div>'
 
 
 def _owner_token() -> str:
@@ -39,15 +60,28 @@ def _get_session(request: web.Request) -> Optional[dict]:
     return None
 
 
-def _get_logo_html() -> str:
-    for fname in ("logo.png", "logo.jpg", "logo.jpeg"):
-        if os.path.isfile(fname):
-            ext = fname.rsplit(".", 1)[-1]
-            with open(fname, "rb") as f:
-                b64 = base64.b64encode(f.read()).decode("ascii")
-            return f'<img src="data:image/{ext};base64,{b64}" alt="QCRM" class="logo-img">'
-    b64_default = "/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAUDBAQEAwUEBAQFBQUGBwwIBwcHBw8LCwkMEQ8SEhEPERETFhwXExQaFRERGCEYGh0dHx8fExciJCIeJBweHx7/2wBDAQUFBQcGBw4ICA4eFBEUHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh4eHh7/wAARCACMAIwDASIAAhEBAxEB/8QAHQABAAICAwEBAAAAAAAAAAAAAAcIBQYDBAkBAv/EAE8QAAEDAwIDAgYNBgoLAAAAAAECAwQABQYHEQgSITFBExQXIlFhFRY4UlRWcYGRlbTS0yMyV3OUlhgzU2JydZKzwdEkNDVCY3R2goShsf/EABsBAQABBQEAAAAAAAAAAAAAAAAFAgMEBgcB/8QAMhEAAgEDAAYIBQUBAAAAAAAAAAECAwQRBRIhMVGRExQWQVJxsdEGYYGS4hUyY6HB8f/aAAwDAQACEQMRAD8AplSlKAUpSgFZq04nlN2iCXasavM+OTsHY0F11G/o5kpIrcOGPD7dnWt2O49eGw7bnHVvyWiejqGm1Och9SikA+omr7606w4ro/b4NtNvVMuDzW8O1w+VpKGgeUKUdtkI7hsCTt0HQ0B5x+T/ADz4k5L9VP8A3aeT/PPiTkv1U/8Adq4Y4s7+QCNLJBB7D465+DX3+FlkH6LJP7a7+DVHSQ4ovdXq+F8infk/zz4k5L9VP/dp5P8APPiTkv1U/wDdq4n8LLIP0WSf2138Gn8LLIP0Vyf2138GnSQ4odXq+F8infk/zz4k5L9VP/dp5P8APPiTkv1U/wDdq3LnGLOacU27p4hC0nZSVXRQIPoILVd7HuMSA9c2mr9hciFCWoBciLN8Otse+5ChPMPUDv8ALVZaaaKRXmzXiyvpYvFqnW55Q5kty462lEekBQFdCvVfVbGcX1U0kmsPCPPhy4CpVtmJAUWl+DKm3UHtHd8o3BrypPbQ8PlKUoBSlKAUpSgFKUoCcOBn3SWP/qZf2dypT12bTL4uZiJI8KmPbmFMpV1CCGQRt86iflNRZwM+6Sx/9TL+zuVKutfuu7p/VjP9wmsPSDatajXBknoVJ6Qop+Jep2+ZXvj9NOZXvj9NfKVzg7dk+8yvfH6a4LhLEK3yZi1HlYaU6evvQT/hXNWKyyDJuePTLdEUlDslAa51diUlQ5ifm36VcpRjKcVLdks3E5xpScFlpPHn3Fd5Dzsl9yS8oqddWXFk9pJO5r8Dtqc7Vp7jEOOEPwjOd28519R6n1AEAVg8002ieJOTcfbcZebHMYpUVJcA7eUnqD6uw1ulLTtrOp0aylx7jl9x8JaQp0nWeG97Se3028y1fDC647wu2YuLKimJMQnfuSHXgB8wrzOr0X4Qsit114eXbLGWRNsolMy21do8IXHUKHqIVt8qTXnRU2aoKUpQClKUApSlAKUpQE4cDPuksf8A1Mv7O5Up6/WjNJnE7epmH4zOvL6IUZoluMpbSOZhP5yuiR85FRZwM+6Sx/8AUy/s7lei02+2OC+4xMu9ujOtgFxDslCFJ37CQT039dUzhGcXGSymXKVWdGaqQeGtxQfUuPq9gsG3zMqjxLQi4qWmO22WXFkpAKtwkq5e0d9YjALlqTmORRbJYpsd+ZL8IGEyUtobWptBWpPMR0PKKtPxK3PRfMMTRaclz22w5kV3w8J6A6mU+05tsR4NG5UCOhT07uo2quWAWqXj93kT8LfnsOusrjov1xiCO600vovxaPzKKVqHTwiz0BOwBO9YFa3sbeGtUjFLyRMWt5pa8qatGpOT+Tf/AAy1hmZmzltxxvJrbAZetnmy3GHQrkcI3SjdClJJ7yO0d/XpW0V07RbotrhJiREqCeYrWtaipbiyd1LUo9VKJ6kmu2T69ieytHvKtKrWcqUdWJ1XRtCvQt4wuJ68+9/4RZqDnc32RetNlfMSOwvwUiYkbqKu8A9wHXs6nY7VtuC469ZUvy3r07c1y0IPOrflAG5BBJJO+9dJzBI8fFbtaoUhUiROWl1LskAbLSdx1A7O36az+LRJNrxqFCuDjRejM8ji0q3TsN9jufQNvoqQurih1ZU7fZtw+L2J547yIsLO6d8694svGVt2ReWtXfh7MPJ3OGqSqy64ZrY2d0xZ9mfe5B2BSeVaT83hFj56pzV0uE62uX/Pc9zoNnxBi3uQo7hHRS1gHp8iGwT/AExVLa3K2UlRgp78LPI5hfyhK6qOn+1yePLIpSlXzEFKUoBSlKAUpSgJw4GfdJY/+pl/Z3KkniBtduu3FjdYtyhsymTbmFlDg6EhhO1RtwM+6Sx/9TL+zuVKutfuu7p/VjP9wmsS/k421RxeHhkloeEZ39GMllOS9Thttjs1s/2faoUU+ltlIP09tZClK5zKcpvMnk7XTpwprVgkl8hWr6oPSYuIPTIby2X4z7LqFoPVJC9v8a2isNnEQzsQusZI3UqMpSflT5w/+Ves5KNxBvdlepi6RhKdpVjHfqvHng0i1arpTGSi62pa3gOrkdYCVevlV2fTWEzLUGdfIqoEOP4hDc6OefzOOD0E9gHqHbWk779fTX0VvVPRNpTqdJGG05RW+IdI1qPQzqbPJZf13l+uFWNHY4YLe4yy22uQ1OdeUlOxcX4V1PMfSdkpHyAV5rV6XcLnuXLR/wAtO/vnq80akSDFKUoBSlKAUpSgFKUoCcOBogcSWPb/AMjL+zuVL/Fjarph+t8fUJ2C9JsdyiNx3Hm09GnEo5FIJ7AdglQ37eo7qqjpxltywXN7Vllp5FS7a+HUoX+a4nYhSD6lJJSflq91n4s9G75YUjIFzrc46gJkQZVvVITv3jdAUlSfWdvkFUVacasHCW5l2hXnQqxqwe2LyvoQYNTcRI38ckD/AMc198pmI/DZH7Oamjy6cLnwS0/uwr8Knl04XPglp/dhX4VQvZ604vmvY2jtnpDhHk/chfymYj8Nkfs5r4rUvD1JKVTHykjYjxc9RU0+XThc+CWn92FfhU8unC58EtP7sK/Cp2eteL5r2HbPSHCPJ+5S2eqGmc+mG+lyMHFeBUfNJRv03Hd0r5EadlymosRtcmQ6sIbaZHOtaj2BKR1JPoq6fl04XPglp/dhX4Vdq18Q3DbapQl2xyHBkAbB2Njzja9vRulsGpxLCwapKWW3g33RrGJ+G6AWywXZIbnR7c85JRvv4NbhW4Ub/wA3m2+avLM1d3Xvi1xaVhc+w6dibNuFwYXHVOejllqMhQ2UpIV5yl7EgdAB27nbaqRGvSkUpSgFKUoBSlKAUpVptNsBtum0LHvGsRazTVbJWhKtVkkjeLao56h+QD05um537NiBtsSQK42/F8luMcSLfj12mMnscYhOOJPzhO1dn2j5p8Ucg+rXvu1by+33No9yVb8j4pMVx29DZCrXb4Da40VX8mpzYcu3Z53Wo01XzXiR04usOPec+kSoFwHNb7pC8C7FlI6dUK5O3qCQevUHqOtAQd7R80+KOQfVr33ae0fNPijkH1a992pm1j1M1200ziRilw1Pkz32GWnS8ww2lBDiAoDZSN+m9dtWoOubeneM5tI1aXHg3+4vQUJcZbBjlskFazybcvTurxvCyz2MXJpLvNX0hwPDrvarljWpbNzwu8S1hVivs1pxmMXOXqw6FgI2OwUD0PU+cOgMdzcCy+PPlRGsduc0Rn3GFPw4q32VqQopJQ4gFKhuD1BqS88uGU53AjwMt1nsl2jRnfDMturQAhexG/mgdxIrv4plGd4rYI1gx7XKz2+2RebwEdtTZSjmUVK23ST1Uon56xevUOP9P2JH9Iu/Cvuj7kQe0fNPijkH1a992ntHzT4o5B9WvfdqcGNRda7hkdkx+xayN3m4XeaiI03FQ2oNcx/PWeTokdp9QPor8az6gcQGl+TMWW6amu3FMmKmVHlw0Nll1BUpJ2JbHUKSQayKdSNSOtHcYVajOjPUnv8ANP0IS9o+afFHIPq177tdC62G+WlIVdLPcYCT2GTFW0D/AGgKtDpzfdaMr06TnFy19tuMW1c9cBJuiW0BTiUhWwVybbkE9PUayV9ynWvFMUk5W3nuI6t4iwtLV2jtttSEMpJ2/KBKQoJO+24J233I2qstFOqVOurWFYhlWnXlf0uhLt0Fl8R8hsRVzexryttlo/4SiR6uo226hMFUApSlAKUpQGz6TQI101QxW2zeXxaVeIjLwV2FKnkgj5x0q1eb3y52pviDzqCp32fizYtiivpJ54UQlKCpHvdwd9x3gGqbWqdItlzi3GG54OTFeQ8yv3q0qCkn6QKubJyCBcES9YLVZXMhwXMbci3Z5Zou6pFukoTy+HCR180d/ToebccwIApWpSiokkkk7nrVgNLZsnI+FPUSyXnmkQ8akwrjaHHOvi7y3ClaEk9gIB6D36vTX7j6M6UXC8M3i1a342cXLyHXo9wWY89DO4Km+U9q9txzco69dq2riGZsWJ6IWe26Rw0P6f326GXcrwh9TynH0L8yOvcBSEp5dxzdfMA7dyoDMcUGmGI5Pq5Nu131exjGpTkSMhUCakl1AS0kAnzh2jqPlrWNZcWs9m4ctOsdgZlarxb/AGfmD2XjAiOObmJPafzd9j17qj3i5ySx5XrVPvOOXNi5W9yHFQiQzvylSWgFDqB2EV27ve8bu/Dfp/h6r/Fj3GLfJjk5sgqVFaWpXK4oejqOw99Uy2JldNZmljJq3tExz9I1h/sn/OntDxz9I9h/sn/OntLxD9JNt/ZFf51071i2MQbVIlxc6hz320btxmoqgpw79gJPT5ajI1XJ4VWX2fiT8reMIuTt4bP5PzJh4T8Nnwbpm2eWCM5kEjG4DkSymK1v4zOeSUpUkHuSknf1K3r5qHgWZSOFa3zctx24228YZc3GkrlN7KfgSVA7779eV0geoVgcwz2LiGhOFYPp9lDiLi+ty7ZBKtkhbS0vrACGVKTsTypOxHZ5grg0C1QlKyydj+pWWXOVi1/tcm2zF3GW4+3HK0bodAUTsQoAbj31SiWFtNfk022lg7Ny9wxbf+uF/ZlV+uE1SlY/q2wSS0rCZa1I7iodhI9I3P0mszh7On+Q8OKdOr9qdZ8dnQ8penB51hbwebDZbSpIG3RXNuDv3dlcMSZpvpJguUWzEc0VnmWZXANpaEOEtqPFYcOyid9ypZ36AEncDoBua9KTF8Hrip07UDGJI57Xc8QmKkpP5oU3y8i/RuOdWx9dQOe2rHQbU5oToVfJuQf6LnGcxPEINuUrZ6FAP8Y64O1JV2benlHaFAVwNAKUpQClKUAra9NdQ8u07vRuuJ3h6C6sBLzWwWy+kf7riD0UP/Y36EVqlKAnd7X3HLorxnJdD8DuU9Q/KSGWVRy4e8kAHcn5a1nI85yS745kreF41LxrCbgthV4t8ILfhNPJPmq51J/I85CfNBG5SO7YCLqtHwqXmyWXQbP3sniiTYJV0gQbkDv5jD+7S3B60c4V/wBtAaXiGo9ki4SiTcdAcavrVuCGJl5EdxtsqPRHhClJSlZ6d43PXbrWYi6l41KtD14jcMOPv21gkOzG23lMt/0lhvlHzmt81DtmP4hwu5zpxZHk3A4/Otq7ncmxsJUqQ+latu7ZDYaT29vTurE5WNYjq9ZlaYC8nBQ3F9gDC5vYjxLkRzeG2/J9vP4TwnXfffuoDA4/ntoyGM5Jx/hVs93YaX4NxyDHffShW2+xKGzsdiDtXBbNSccuk2TCtvC/YZsqLv4wzHaecW1seU8yQ3unr0699b5ZHMfRgudLxS35vOsflBc8SRhb6mnwjxY9d0pO7HbsNu9FaHrizlaNW9RncT9mkS3n7dJkItqXEOtNuMcxQ74M7+apSQrfpzD00B+X9TcYYNwD/DHjzRtnL4+FoeSYvMeVPhd0eZuSAObbrXPjmoNkyRL6sd4WLLeExykPGAw++G+bfl5uRs7b7Hbf0GuLGLRlF5xHWO0qtt5uGQvWmxh6Kplx2Wt0OslfMkgrKhsSd+vQ1rug9vuER3IYMm0aveNRnmmn2cPWWSysc4KZKSkkK3B5Qdttl0Bmbxqxh1muLttu/DZjFvmskB2NKLjTre4BHMlSAR0IPX01wN8RbdjQpzAtK8JxacR5s5uJ4d9v1pUoAD5wRUZauJUjUO6pWxlDCgpvdGSL5riPyaf447Dr6P5vLWqUBlMpyG95Te5F6yG5yblcJB3dffXzKPoA7gB3AbAd1YulKAUpSgFKUoBSlKAV2mbhPZgPW9qbJbhvqSp5hLqg24U9hUnfYkd29dWlAdtNyuKYciEmfKEaSpKn2Q8rkdKfzSpO+yiO7fsrmjXy9RrW7ao93uDNve38LFbkrS0vft3QDsfnFY6lAZWzZHkFlZWzZ77c7c2tXMtEWW40lStttyEkbmuONfb1GlSZUa73Bl+V/rDrclaVvdd/PIO6uvXrWOpQGWiZNkcSfJuEW/3ViZKIMh9uY4lx3b3ygd1fPS35NkdvfkyIF/usV6WvwklxmY4hTyuvnLIUCo9T1PpNYmlAdi4zptymuTbhLkTJTuxcefcU4tWw2G6lEk9ABXXpSgFKUoBSlKA//9k="
-    return f'<img src="data:image/jpeg;base64,{b64_default}" alt="QCRM" class="logo-img">' 
+FALLING_BG_JS = """
+(function(){
+  const icons = [
+    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.5"><rect x="6" y="2" width="12" height="20" rx="2.5"/><line x1="10" y1="18" x2="14" y2="18"/></svg>',
+    '<svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4"/><circle cx="15.5" cy="10.5" r="1"/><circle cx="17.5" cy="12.5" r="1"/></svg>',
+    '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.4"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><rect x="7" y="6" width="10" height="4" rx="1"/><rect x="7" y="14" width="10" height="4" rx="1"/></svg>',
+    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3.3 7L12 12l8.7-5M12 22V12"/></svg>'
+  ];
+  const wrap = document.getElementById('bgFall');
+  if (!wrap) return;
+  for (let i = 0; i < 16; i++) {
+    const d = document.createElement('div');
+    d.className = 'fall-item';
+    d.innerHTML = icons[i % icons.length];
+    d.style.left = ((i * 6.5 + (i % 3) * 2) % 94) + '%';
+    d.style.animationDuration = (12 + (i % 5) * 2.5) + 's';
+    d.style.animationDelay = (-1 * (i * 1.7)) + 's';
+    wrap.appendChild(d);
+  }
+})();
+"""
+
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -59,7 +93,7 @@ LOGIN_HTML = """<!DOCTYPE html>
   :root { --bg:#070709; --border:rgba(255,255,255,.12); --orange:#ff5a1f; --text:#f4f4f5; --muted:#a1a1aa; }
   * { box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
   body {
-    margin:0; background:radial-gradient(circle at 20% 20%, rgba(255,90,31,.16), transparent 45%),
+    margin:0; background:radial-gradient(circle at 20% 20%, rgba(255,90,31,.18), transparent 45%),
     radial-gradient(circle at 80% 80%, rgba(255,90,31,.12), transparent 50%), var(--bg);
     color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center;
     padding:20px; overflow:hidden; position:relative;
@@ -68,11 +102,10 @@ LOGIN_HTML = """<!DOCTYPE html>
   .fall-item {
     position:absolute; top:-80px; opacity:0; will-change:transform,opacity;
     animation:fallDown linear infinite;
-    filter:drop-shadow(0 0 8px rgba(255,90,31,.15));
   }
   @keyframes fallDown {
     0% { transform:translate3d(0,-80px,0) rotate(0deg); opacity:0; }
-    12% { opacity:.14; }
+    12% { opacity:.15; }
     85% { opacity:.12; }
     100% { transform:translate3d(24px,112vh,0) rotate(320deg); opacity:0; }
   }
@@ -82,15 +115,15 @@ LOGIN_HTML = """<!DOCTYPE html>
   }
   .box {
     position:relative; z-index:2; width:100%; max-width:360px;
-    background:rgba(20,20,24,.62);
+    background:rgba(20,20,24,.64);
     backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
     border:1px solid var(--border);
     box-shadow:0 24px 60px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.08);
     border-radius:24px; padding:30px 26px; text-align:center;
     animation:cardIn .45s cubic-bezier(.16,1,.3,1);
   }
-  .logo-svg,.logo-img {
-    width:64px; height:64px; border-radius:16px; object-fit:cover; margin-bottom:12px;
+  .logo-img {
+    width:66px; height:66px; border-radius:16px; object-fit:cover; margin-bottom:12px;
     border:1px solid rgba(255,90,31,.45); box-shadow:0 8px 24px rgba(255,90,31,.25);
   }
   h1 { margin:0 0 6px; font-size:26px; letter-spacing:.6px; font-weight:800; }
@@ -99,16 +132,14 @@ LOGIN_HTML = """<!DOCTYPE html>
   input {
     width:100%; padding:13px 15px; border-radius:13px; border:1px solid rgba(255,255,255,.12);
     background:rgba(10,10,13,.65); color:#fff; font-size:16px; outline:none; margin-bottom:14px;
-    transition:border-color .2s, box-shadow .2s;
   }
   input:focus { border-color:var(--orange); box-shadow:0 0 0 3px rgba(255,90,31,.2); }
   button {
     width:100%; padding:13px; border:none; border-radius:13px;
     background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff;
     font-weight:700; font-size:15px; cursor:pointer;
-    box-shadow:0 10px 25px rgba(255,90,31,.3); transition:transform .15s, box-shadow .2s;
+    box-shadow:0 10px 25px rgba(255,90,31,.3);
   }
-  button:active { transform:scale(.97); }
   .err { color:#fca5a5; background:rgba(239,68,68,.15); border:1px solid rgba(239,68,68,.3); padding:8px; border-radius:10px; font-size:13px; margin-bottom:12px; }
 </style>
 </head>
@@ -122,58 +153,48 @@ LOGIN_HTML = """<!DOCTYPE html>
     <input type="password" name="password" placeholder="Пароль доступа" required autofocus>
     <button type="submit">Войти</button>
   </form>
-<script>
-(function(){
-  const icons = [
-    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.5"><rect x="6" y="2" width="12" height="20" rx="2.5"/><line x1="10" y1="18" x2="14" y2="18"/></svg>',
-    '<svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4"/><circle cx="15.5" cy="10.5" r="1"/><circle cx="17.5" cy="12.5" r="1"/></svg>',
-    '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.4"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><rect x="7" y="6" width="10" height="4" rx="1"/><rect x="7" y="14" width="10" height="4" rx="1"/></svg>',
-    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3.3 7L12 12l8.7-5M12 22V12"/></svg>'
-  ];
-  const wrap = document.getElementById('bgFall');
-  for (let i = 0; i < 16; i++) {
-    const d = document.createElement('div');
-    d.className = 'fall-item';
-    d.innerHTML = icons[i % icons.length];
-    d.style.left = ((i * 6.5 + (i % 3) * 2) % 94) + '%';
-    d.style.animationDuration = (11 + (i % 5) * 2.4) + 's';
-    d.style.animationDelay = (-1 * (i * 1.7)) + 's';
-    wrap.appendChild(d);
-  }
-})();
-</script>
+<script>__FALL_JS__</script>
 </body>
 </html>"""
+
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
 <title>QCRM — QHEAD Mobile</title>
 <style>
   :root {
     --bg: #070709;
-    --surface: rgba(20, 20, 25, .72);
-    --card: rgba(24, 24, 30, .68);
-    --card-2: rgba(34, 34, 42, .65);
+    --surface: rgba(20, 20, 26, .74);
+    --card: rgba(24, 24, 32, .68);
+    --card-2: rgba(34, 34, 44, .64);
     --border: rgba(255, 255, 255, .09);
     --orange: #ff5a1f;
-    --orange-soft: rgba(255,90,31,.15);
+    --orange-soft: rgba(255,90,31,.16);
     --green: #22c55e;
-    --green-soft: rgba(34,197,94,.15);
+    --green-soft: rgba(34,197,94,.16);
     --red: #ef4444;
-    --red-soft: rgba(239,68,68,.15);
+    --red-soft: rgba(239,68,68,.16);
     --text: #f4f4f5;
     --muted: #a1a1aa;
   }
-  * { box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
+  * { box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; -webkit-tap-highlight-color:transparent; }
   body {
-    margin:0; color:var(--text); padding-bottom:70px; min-height:100vh;
+    margin:0; color:var(--text); padding-bottom:92px; min-height:100vh; position:relative;
     background:
-      radial-gradient(circle at 12% 8%, rgba(255,90,31,.14), transparent 38%),
-      radial-gradient(circle at 88% 32%, rgba(255,90,31,.09), transparent 42%),
+      radial-gradient(circle at 15% 10%, rgba(255,90,31,.16), transparent 40%),
+      radial-gradient(circle at 85% 40%, rgba(255,90,31,.1), transparent 45%),
       var(--bg);
+  }
+  .bg-fall { position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:0; transition:opacity .35s; }
+  .fall-item { position:absolute; top:-80px; opacity:0; will-change:transform,opacity; animation:fallDown linear infinite; }
+  @keyframes fallDown {
+    0% { transform:translate3d(0,-80px,0) rotate(0deg); opacity:0; }
+    12% { opacity:.11; }
+    85% { opacity:.09; }
+    100% { transform:translate3d(24px,112vh,0) rotate(320deg); opacity:0; }
   }
   @keyframes fadeUp {
     from { opacity:0; transform:translateY(12px); }
@@ -189,121 +210,153 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   }
   .topbar {
     position:sticky; top:0; z-index:30;
-    background:rgba(12,12,16,.76);
+    background:rgba(12,12,16,.78);
     backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
     border-bottom:1px solid var(--border);
-    padding:12px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px;
+    padding:10px 16px; display:flex; align-items:center; justify-content:space-between; gap:10px;
   }
   .brand { display:flex; align-items:center; gap:10px; }
-  .logo-svg,.logo-img {
-    width:40px; height:40px; border-radius:11px; object-fit:cover; flex-shrink:0;
-    border:1px solid rgba(255,90,31,.4); box-shadow:0 4px 16px rgba(255,90,31,.2);
+  .logo-img {
+    width:38px; height:38px; border-radius:10px; object-fit:cover; flex-shrink:0;
+    border:1px solid rgba(255,90,31,.45); box-shadow:0 4px 16px rgba(255,90,31,.25);
   }
-  .brand-title { font-weight:800; font-size:20px; letter-spacing:.5px; line-height:1.1; display:flex; align-items:center; gap:7px; }
+  .brand-title { font-weight:800; font-size:19px; letter-spacing:.5px; line-height:1.1; display:flex; align-items:center; gap:7px; }
   .brand-title span { color:var(--orange); }
   .live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); display:inline-block; animation:pulseDot 2s infinite; }
-  .brand-sub { font-size:11px; color:var(--muted); letter-spacing:.8px; text-transform:uppercase; }
-  .tabs { display:flex; gap:8px; padding:14px 16px 4px; max-width:1160px; margin:0 auto; overflow-x:auto; }
-  .tab {
-    border:1px solid var(--border); background:var(--surface); color:var(--muted);
-    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
-    padding:9px 15px; border-radius:12px; font-weight:600; font-size:14px; cursor:pointer; white-space:nowrap;
-    transition:transform .14s, background .2s, color .2s, border-color .2s;
+  .brand-sub { font-size:10px; color:var(--muted); letter-spacing:.8px; text-transform:uppercase; }
+  .wrap { position:relative; z-index:2; max-width:1120px; margin:0 auto; padding:14px 14px; }
+
+  .hero-card {
+    background:linear-gradient(135deg, rgba(255,90,31,.22), rgba(24,24,32,.78));
+    backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
+    border:1px solid rgba(255,90,31,.38); border-radius:22px; padding:18px;
+    box-shadow:0 16px 40px rgba(0,0,0,.45), inset 0 1px 0 rgba(255,255,255,.1);
+    margin-bottom:14px; animation:fadeUp .35s ease;
   }
-  .tab:active { transform:scale(.96); }
-  .tab.active {
-    background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff; border-color:transparent;
-    box-shadow:0 6px 20px rgba(255,90,31,.28);
-  }
-  .wrap { max-width:1160px; margin:0 auto; padding:12px 16px; }
-  .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:18px; }
+  .hero-row { display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }
+  .hero-lbl { font-size:12px; color:#fed7aa; margin-bottom:4px; }
+  .hero-val { font-size:28px; font-weight:800; letter-spacing:-.5px; }
+  .hero-sub { font-size:13px; color:var(--green); font-weight:700; }
+
+  .kpi-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-bottom:16px; }
   .kpi {
     background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px;
     backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
-    box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.06);
     animation:fadeUp .35s ease backwards;
-    transition:transform .18s, border-color .2s;
   }
-  .kpi:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
-  .kpi-label { font-size:12px; color:var(--muted); margin-bottom:6px; }
-  .kpi-val { font-size:20px; font-weight:800; }
+  .kpi-label { font-size:11px; color:var(--muted); margin-bottom:6px; }
+  .kpi-val { font-size:18px; font-weight:800; }
   .kpi-val.orange { color:var(--orange); }
   .kpi-val.green { color:var(--green); }
+
+  .quick-grid { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; margin-bottom:18px; }
+  .quick-btn {
+    background:var(--card-2); border:1px solid var(--border); border-radius:16px;
+    padding:12px 8px; text-align:center; color:#fff; font-weight:700; font-size:12px;
+    cursor:pointer; backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    transition:transform .12s, border-color .2s;
+  }
+  .quick-btn:active { transform:scale(.95); }
+  .quick-btn .ico { font-size:20px; display:block; margin-bottom:5px; }
+
+  .sec-title { font-size:14px; font-weight:700; color:var(--muted); margin:6px 0 10px; text-transform:uppercase; letter-spacing:.6px; }
+
   .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; }
   .search {
-    flex:1; min-width:210px; background:var(--surface); border:1px solid var(--border);
+    flex:1; min-width:180px; background:var(--surface); border:1px solid var(--border);
     backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
-    color:#fff; padding:10px 14px; border-radius:12px; font-size:14px; outline:none; transition:border-color .2s;
+    color:#fff; padding:10px 14px; border-radius:12px; font-size:14px; outline:none;
   }
   .search:focus { border-color:var(--orange); }
   .btn {
     border:none; border-radius:11px; padding:9px 14px; font-weight:600; font-size:13px;
-    cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:transform .12s, opacity .15s;
+    cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:transform .12s;
   }
   .btn:active { transform:scale(.95); }
-  .btn-orange { background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff; box-shadow:0 4px 16px rgba(255,90,31,.25); }
+  .btn-orange { background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff; box-shadow:0 4px 16px rgba(255,90,31,.28); }
   .btn-dark { background:var(--card-2); color:var(--text); border:1px solid var(--border); }
   .btn-green { background:var(--green-soft); color:var(--green); border:1px solid rgba(34,197,94,.3); }
   .btn-red { background:var(--red-soft); color:var(--red); border:1px solid rgba(239,68,68,.3); }
   .btn-sm { padding:6px 10px; font-size:12px; border-radius:9px; }
 
-  .ship-list { display:flex; flex-direction:column; gap:14px; }
+  .ship-list { display:flex; flex-direction:column; gap:12px; }
   .ship-card {
     background:var(--card); border:1px solid var(--border); border-radius:18px; overflow:hidden;
     backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
-    box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05);
     animation:fadeUp .35s ease backwards;
   }
   .ship-head {
-    padding:14px 16px; background:rgba(16,16,20,.6); border-bottom:1px solid var(--border);
+    padding:13px 15px; background:rgba(16,16,22,.62); border-bottom:1px solid var(--border);
     display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;
   }
-  .ship-title { font-size:17px; font-weight:700; display:flex; align-items:center; gap:8px; }
-  .badge { font-size:11px; font-weight:700; padding:3px 8px; border-radius:999px; }
+  .ship-title { font-size:16px; font-weight:700; display:flex; align-items:center; gap:8px; }
+  .badge { font-size:11px; font-weight:700; padding:3px 9px; border-radius:999px; }
   .badge-active { background:var(--orange-soft); color:var(--orange); }
   .badge-arch { background:rgba(255,255,255,.08); color:var(--muted); }
   .badge-sold { background:var(--green-soft); color:var(--green); }
   .ship-actions { display:flex; flex-wrap:wrap; gap:6px; }
-  .items-grid {
-    padding:12px; display:grid; grid-template-columns:repeat(auto-fill,minmax(250px,1fr)); gap:10px;
-  }
+  .items-grid { padding:12px; display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px; }
   .micro-card {
     background:var(--card-2); border:1px solid var(--border); border-radius:14px;
     padding:12px; display:flex; flex-direction:column; justify-content:space-between; gap:8px;
-    transition:transform .16s, border-color .2s;
   }
-  .micro-card:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
-  .micro-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
-  .micro-name { font-weight:700; font-size:14px; line-height:1.3; }
+  .micro-name { font-weight:700; font-size:14px; }
   .track-pill {
-    display:inline-block; background:rgba(9,9,11,.75); border:1px solid var(--border);
+    display:inline-block; background:rgba(9,9,11,.78); border:1px solid var(--border);
     padding:4px 8px; border-radius:8px; font-family:ui-monospace,SFMono-Regular,monospace;
     font-size:12px; color:#e4e4e7; cursor:pointer; user-select:all;
   }
   .meta-row { font-size:12px; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px; align-items:center; }
   .owner-my { color:var(--orange); font-weight:600; }
   .owner-client { color:#60a5fa; font-weight:600; }
-  .micro-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:2px; }
+  .micro-actions { display:flex; flex-wrap:wrap; gap:6px; }
 
+  /* Красивые карточки постов в наличии */
   .posts-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px; }
   .post-card {
-    background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px;
+    background:var(--card); border:1px solid var(--border); border-radius:18px; padding:15px;
     backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
     display:flex; flex-direction:column; justify-content:space-between; gap:12px;
-    animation:fadeUp .35s ease backwards; transition:transform .16s, border-color .2s;
+    animation:fadeUp .35s ease backwards;
   }
-  .post-card:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
-  .post-text { font-size:13px; line-height:1.45; white-space:pre-wrap; color:#e4e4e7; max-height:190px; overflow:auto; }
+  .post-head { display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }
+  .post-title { font-size:16px; font-weight:800; line-height:1.25; }
+  .post-price {
+    background:var(--orange-soft); color:var(--orange); border:1px solid rgba(255,90,31,.35);
+    padding:4px 10px; border-radius:10px; font-weight:800; font-size:13px; white-space:nowrap;
+  }
+  .post-body { font-size:13px; line-height:1.45; color:#d4d4d8; white-space:pre-wrap; }
   .post-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; border-top:1px solid var(--border); padding-top:10px; }
+  .status-live { font-size:11px; font-weight:700; color:var(--green); display:flex; align-items:center; gap:5px; }
+
+  /* Нижний стеклянный Dock (Tab Bar) */
+  .dock {
+    position:fixed; bottom:0; left:0; right:0; z-index:40;
+    background:rgba(14,14,18,.84);
+    backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+    border-top:1px solid var(--border);
+    display:flex; justify-content:space-around; align-items:center;
+    padding:8px 6px calc(8px + env(safe-area-inset-bottom));
+  }
+  .dock-btn {
+    background:none; border:none; color:var(--muted); font-size:11px; font-weight:600;
+    display:flex; flex-direction:column; align-items:center; gap:3px; cursor:pointer;
+    padding:4px 8px; border-radius:12px; transition:color .15s, transform .12s;
+  }
+  .dock-btn .d-ico { font-size:19px; line-height:1; }
+  .dock-btn.active { color:var(--orange); }
+  .dock-btn:active { transform:scale(.92); }
 
   .modal-bg {
-    position:fixed; inset:0; background:rgba(0,0,0,.68);
+    position:fixed; inset:0; background:rgba(0,0,0,.72);
     backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
     z-index:50; display:none; align-items:center; justify-content:center; padding:16px;
   }
   .modal-bg.open { display:flex; }
   .modal {
-    width:100%; max-width:420px; background:rgba(24,24,30,.88);
+    width:100%; max-width:430px; max-height:90vh; overflow-y:auto;
+    background:rgba(24,24,30,.92);
     backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
     border:1px solid rgba(255,255,255,.12); border-radius:20px; padding:20px;
     box-shadow:0 24px 60px rgba(0,0,0,.65);
@@ -312,23 +365,25 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .modal h3 { margin:0 0 12px; font-size:17px; }
   .field { margin-bottom:10px; }
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
-  .field input, .field select {
+  .field input, .field select, .field textarea {
     width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--border);
-    background:rgba(10,10,14,.7); color:#fff; font-size:14px; outline:none;
+    background:rgba(10,10,14,.72); color:#fff; font-size:14px; outline:none;
   }
-  .field input:focus, .field select:focus { border-color:var(--orange); }
+  .field textarea { min-height:110px; resize:vertical; }
+  .field input:focus, .field textarea:focus { border-color:var(--orange); }
   .modal-btns { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
   .toast {
-    position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
-    background:rgba(24,24,30,.92); backdrop-filter:blur(12px);
+    position:fixed; bottom:84px; left:50%; transform:translateX(-50%);
+    background:rgba(24,24,30,.95); backdrop-filter:blur(12px);
     color:#fff; padding:10px 16px; border-radius:12px;
     border:1px solid var(--orange); font-size:13px; z-index:60; display:none;
-    animation:fadeUp .2s ease;
   }
-  .empty { text-align:center; padding:34px 16px; color:var(--muted); background:var(--card); border:1px dashed var(--border); border-radius:16px; }
+  .empty { text-align:center; padding:32px 16px; color:var(--muted); background:var(--card); border:1px dashed var(--border); border-radius:16px; }
 </style>
 </head>
 <body>
+  <div class="bg-fall" id="bgFall"></div>
+
   <header class="topbar">
     <div class="brand">
       __LOGO__
@@ -337,42 +392,44 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div class="brand-sub">QHEAD Mobile</div>
       </div>
     </div>
-    <div style="display:flex;gap:8px"><button class="btn btn-dark btn-sm" onclick="loadAll()">🔄</button><a href="/logout" class="btn btn-dark btn-sm" style="text-decoration:none">🚪 Выйти</a></div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-dark btn-sm" onclick="loadAll()">🔄</button>
+      <a href="/logout" class="btn btn-dark btn-sm" style="text-decoration:none">🚪 Выйти</a>
+    </div>
   </header>
 
-  <nav class="tabs">
-    <button class="tab active" onclick="switchTab('crm', this)">📦 CRM Отправки</button>
-    <button class="tab" onclick="switchTab('direct', this)">🏷 Свои товары</button>
-    <button class="tab" onclick="switchTab('posts', this)">📝 В наличии (Посты)</button>
-    <button class="tab" onclick="switchTab('archive', this)">🗄 Архив</button>
-  </nav>
-
   <main class="wrap">
-    <section id="kpiBar" class="kpi-grid"></section>
+    <!-- ГЛАВНАЯ -->
+    <section id="view-home"></section>
 
-    <section id="view-crm">
+    <!-- CRM ОТПРАВКИ -->
+    <section id="view-crm" style="display:none">
       <div class="toolbar">
-        <input class="search" id="crmSearch" placeholder="Поиск по отправке, товару, треку или клиенту..." oninput="render()">
-        <button class="btn btn-orange" onclick="openNewShipment()">+ Новая отправка</button>
+        <input class="search" id="crmSearch" placeholder="Поиск по отправке, товару, треку..." oninput="render()">
+        <button class="btn btn-orange" onclick="openNewShipment()">+ Отправка</button>
       </div>
       <div id="crmList" class="ship-list"></div>
     </section>
 
+    <!-- СВОИ ТОВАРЫ -->
     <section id="view-direct" style="display:none">
       <div class="toolbar">
         <input class="search" id="directSearch" placeholder="Поиск по названию или состоянию..." oninput="render()">
-        <button class="btn btn-orange" onclick="openNewDirect()">+ Добавить свой товар</button>
+        <button class="btn btn-orange" onclick="openNewDirect()">+ Свой товар</button>
       </div>
       <div id="directList" class="posts-grid"></div>
     </section>
 
+    <!-- ПОСТЫ В НАЛИЧИИ -->
     <section id="view-posts" style="display:none">
       <div class="toolbar">
-        <input class="search" id="postsSearch" placeholder="Поиск по тексту объявления в наличии..." oninput="render()">
+        <input class="search" id="postsSearch" placeholder="Поиск по объявлениям в наличии..." oninput="render()">
+        <button class="btn btn-orange" onclick="openNewPost()">+ Создать пост</button>
       </div>
       <div id="postsList" class="posts-grid"></div>
     </section>
 
+    <!-- АРХИВ -->
     <section id="view-archive" style="display:none">
       <div class="toolbar">
         <input class="search" id="archSearch" placeholder="Поиск в архиве..." oninput="render()">
@@ -381,14 +438,24 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
   </main>
 
+  <nav class="dock" id="dockBar">
+    <button class="dock-btn active" data-tab="home" onclick="switchTab('home')"><span class="d-ico">🏠</span>Главная</button>
+    <button class="dock-btn" data-tab="crm" onclick="switchTab('crm')"><span class="d-ico">📦</span>CRM</button>
+    <button class="dock-btn" data-tab="direct" onclick="switchTab('direct')"><span class="d-ico">🏷</span>Свои</button>
+    <button class="dock-btn" data-tab="posts" onclick="switchTab('posts')"><span class="d-ico">📝</span>Посты</button>
+    <button class="dock-btn" data-tab="archive" onclick="switchTab('archive')"><span class="d-ico">🗄</span>Архив</button>
+  </nav>
+
   <div id="modalBg" class="modal-bg" onclick="if(event.target===this) closeModal()">
     <div class="modal" id="modalBody"></div>
   </div>
   <div id="toast" class="toast"></div>
 
 <script>
-let STATE = { role: 'owner', label: 'QHEAD Mobile', finances: {}, shipments: [], posts: [], direct_items: [] };
-let CURRENT_TAB = 'crm';
+__FALL_JS__
+
+let STATE = { role: 'owner', finances: {}, shipments: [], posts: [], direct_items: [], unsold_my: [] };
+let CURRENT_TAB = 'home';
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -401,21 +468,20 @@ function toast(msg) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.style.display = 'block';
-  setTimeout(() => t.style.display = 'none', 2400);
+  setTimeout(() => t.style.display = 'none', 2500);
 }
 function copyText(txt) {
   if (!txt) return;
   navigator.clipboard?.writeText(txt);
   toast('Скопировано: ' + txt);
 }
-function switchTab(tab, btn) {
+function switchTab(tab) {
   CURRENT_TAB = tab;
-  document.querySelectorAll('.tab').forEach(b => b.classList.remove('active'));
-  btn.classList.add('active');
-  document.getElementById('view-crm').style.display = tab === 'crm' ? '' : 'none';
-  document.getElementById('view-direct').style.display = tab === 'direct' ? '' : 'none';
-  document.getElementById('view-posts').style.display = tab === 'posts' ? '' : 'none';
-  document.getElementById('view-archive').style.display = tab === 'archive' ? '' : 'none';
+  document.querySelectorAll('.dock-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
+  ['home','crm','direct','posts','archive'].forEach(t => {
+    document.getElementById('view-' + t).style.display = (t === tab) ? '' : 'none';
+  });
+  document.getElementById('bgFall').style.opacity = (tab === 'home') ? '1' : '0.25';
   render();
 }
 
@@ -439,43 +505,92 @@ async function loadAll() {
 
 function render() {
   const isPersonalOnly = STATE.role === 'admin_personal';
-  const tabBtns = document.querySelectorAll('.tab');
   if (isPersonalOnly) {
-    if (tabBtns[0]) tabBtns[0].style.display = 'none';
-    if (tabBtns[2]) tabBtns[2].style.display = 'none';
-    if (tabBtns[3]) tabBtns[3].style.display = 'none';
-    if (CURRENT_TAB !== 'direct') {
-      CURRENT_TAB = 'direct';
-      tabBtns.forEach(b => b.classList.remove('active'));
-      if (tabBtns[1]) tabBtns[1].classList.add('active');
-      document.getElementById('view-crm').style.display = 'none';
-      document.getElementById('view-direct').style.display = '';
-      document.getElementById('view-posts').style.display = 'none';
-      document.getElementById('view-archive').style.display = 'none';
-    }
-  }
-  const f = STATE.finances || {};
-  if (isPersonalOnly) {
-    document.getElementById('kpiBar').innerHTML = `
-      <div class="kpi"><div class="kpi-label">В наличии</div><div class="kpi-val">${f.in_stock_count || 0} шт.</div></div>
-      <div class="kpi"><div class="kpi-label">Всего вложено</div><div class="kpi-val orange">${fmtMoney(f.invested)}</div></div>
-      <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue)}</div></div>
-      <div class="kpi"><div class="kpi-label">Прибыль по проданным</div><div class="kpi-val green">${fmtMoney(f.profit)}</div></div>
-    `;
-  } else {
-    document.getElementById('kpiBar').innerHTML = `
-      <div class="kpi"><div class="kpi-label">Вложено (товары + доставка)</div><div class="kpi-val orange">${fmtMoney(f.total_spent)}</div></div>
-      <div class="kpi"><div class="kpi-label">В пути (мои товары)</div><div class="kpi-val">${fmtMoney(f.invested_active)}</div></div>
-      <div class="kpi"><div class="kpi-label">Доставка (архив)</div><div class="kpi-val">${fmtMoney(f.delivery_total)}</div></div>
-      <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue_total)}</div></div>
-      <div class="kpi"><div class="kpi-label">Прибыль по проданным</div><div class="kpi-val green">${fmtMoney(f.sold_profit_items)}</div></div>
-    `;
+    document.querySelectorAll('.dock-btn').forEach(b => {
+      if (b.dataset.tab !== 'home' && b.dataset.tab !== 'direct') b.style.display = 'none';
+    });
+    if (CURRENT_TAB !== 'home' && CURRENT_TAB !== 'direct') switchTab('home');
   }
 
+  if (CURRENT_TAB === 'home') renderHome(isPersonalOnly);
   if (CURRENT_TAB === 'crm') renderShipments('active', 'crmList', 'crmSearch');
   if (CURRENT_TAB === 'archive') renderShipments('archived', 'archList', 'archSearch');
   if (CURRENT_TAB === 'direct') renderDirect();
   if (CURRENT_TAB === 'posts') renderPosts();
+}
+
+function renderHome(isPersonalOnly) {
+  const f = STATE.finances || {};
+  const el = document.getElementById('view-home');
+
+  if (isPersonalOnly) {
+    el.innerHTML = `
+      <div class="hero-card">
+        <div class="hero-row">
+          <div>
+            <div class="hero-lbl">💼 Ваш личный бюджет (вложено)</div>
+            <div class="hero-val">${fmtMoney(f.invested)}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="hero-lbl">📈 Прибыль</div>
+            <div class="hero-sub">${fmtMoney(f.profit)}</div>
+          </div>
+        </div>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">📦 В наличии</div><div class="kpi-val">${f.in_stock_count || 0} шт.</div></div>
+        <div class="kpi"><div class="kpi-label">💵 Выручка</div><div class="kpi-val green">${fmtMoney(f.revenue)}</div></div>
+      </div>
+      <div class="sec-title">Быстрые действия</div>
+      <div class="quick-grid">
+        <button class="quick-btn" onclick="openNewDirect()"><span class="ico">➕</span>Добавить товар</button>
+        <button class="quick-btn" onclick="switchTab('direct')"><span class="ico">🏷</span>Мои товары</button>
+        <button class="quick-btn" onclick="loadAll()"><span class="ico">🔄</span>Обновить</button>
+      </div>
+    `;
+    return;
+  }
+
+  const activeShips = STATE.shipments.filter(s => s.status === 'active').length;
+  const activePosts = STATE.posts.filter(p => p.status === 'active').length;
+  const directInStock = (STATE.direct_items || []).filter(d => d.status !== 'sold').length;
+
+  el.innerHTML = `
+    <div class="hero-card">
+      <div class="hero-row">
+        <div>
+          <div class="hero-lbl">💳 Всего вложено (товары + доставка)</div>
+          <div class="hero-val">${fmtMoney(f.total_spent)}</div>
+        </div>
+        <div style="text-align:right">
+          <div class="hero-lbl">📈 Прибыль по проданным</div>
+          <div class="hero-sub">${fmtMoney(f.sold_profit_items)}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-label">📦 В пути (мои товары)</div><div class="kpi-val orange">${fmtMoney(f.invested_active)}</div></div>
+      <div class="kpi"><div class="kpi-label">🚚 Доставка (архив)</div><div class="kpi-val">${fmtMoney(f.delivery_total)}</div></div>
+      <div class="kpi"><div class="kpi-label">💵 Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue_total)}</div></div>
+      <div class="kpi"><div class="kpi-label">🏦 Общий баланс</div><div class="kpi-val ${Number(f.net_overall||0)>=0?'green':'orange'}">${fmtMoney(f.net_overall)}</div></div>
+    </div>
+
+    <div class="sec-title">Быстрые действия</div>
+    <div class="quick-grid">
+      <button class="quick-btn" onclick="openNewShipment()"><span class="ico">📦</span>+ Отправка</button>
+      <button class="quick-btn" onclick="openNewDirect()"><span class="ico">🏷</span>+ Свой товар</button>
+      <button class="quick-btn" onclick="openNewPost()"><span class="ico">📝</span>+ Пост в канал</button>
+    </div>
+
+    <div class="sec-title">Сводка сейчас</div>
+    <div class="kpi-grid">
+      <div class="kpi" onclick="switchTab('crm')" style="cursor:pointer"><div class="kpi-label">Активных отправок</div><div class="kpi-val orange">${activeShips} шт.</div></div>
+      <div class="kpi" onclick="switchTab('posts')" style="cursor:pointer"><div class="kpi-label">Постов #НАЛИЧИЕ</div><div class="kpi-val green">${activePosts} шт.</div></div>
+      <div class="kpi" onclick="switchTab('direct')" style="cursor:pointer"><div class="kpi-label">Своих в наличии</div><div class="kpi-val">${directInStock} шт.</div></div>
+      <div class="kpi"><div class="kpi-label">Продано всего (моих)</div><div class="kpi-val green">${f.sold_count || 0} шт.</div></div>
+    </div>
+  `;
 }
 
 function renderShipments(status, listId, searchId) {
@@ -513,11 +628,9 @@ function renderShipments(status, listId, searchId) {
       return `
         <div class="micro-card">
           <div>
-            <div class="micro-top">
-              <div class="micro-name">${esc(it.name)}</div>
-            </div>
+            <div class="micro-name">${esc(it.name)}</div>
             <div style="margin:6px 0">
-              <span class="track-pill" onclick="copyText('${esc(it.track_number)}')" title="Нажмите, чтобы скопировать">${esc(it.track_number || 'без трека')}</span>
+              <span class="track-pill" onclick="copyText('${esc(it.track_number)}')">${esc(it.track_number || 'без трека')}</span>
             </div>
             <div class="meta-row">${ownerHtml}</div>
           </div>
@@ -542,7 +655,7 @@ function renderShipments(status, listId, searchId) {
             <span class="badge ${status==='active'?'badge-active':'badge-arch'}">${s.items.length} шт.</span>
           </div>
           <div class="ship-actions">
-            <button class="btn btn-dark btn-sm" onclick="copyTracks(${s.id})">📋 Список треков</button>
+            <button class="btn btn-dark btn-sm" onclick="copyTracks(${s.id})">📋 Треки</button>
             <button class="btn btn-orange btn-sm" onclick="openAddItem(${s.id})">+ Товар</button>
             ${arriveBtn}
           </div>
@@ -553,21 +666,50 @@ function renderShipments(status, listId, searchId) {
   }).join('');
 }
 
+function parsePostCard(rawText) {
+  const lines = String(rawText || '').split('\\n').map(l => l.trim()).filter(Boolean);
+  const title = lines[0] || 'Объявление';
+  let price = '';
+  const bodyLines = [];
+  for (let i = 1; i < lines.length; i++) {
+    const l = lines[i];
+    if (/^#наличие$/i.test(l)) continue;
+    const pm = l.match(/цена\s*:\s*([\\d\\s.,]+)/i);
+    if (pm) {
+      price = pm[1].trim() + ' ₽';
+    } else {
+      bodyLines.push(l);
+    }
+  }
+  return { title, price, body: bodyLines.join('\\n') };
+}
+
 function renderPosts() {
   const q = (document.getElementById('postsSearch').value || '').toLowerCase();
   const activePosts = STATE.posts.filter(p => p.status === 'active' && (!q || p.text.toLowerCase().includes(q)));
   const el = document.getElementById('postsList');
   if (!activePosts.length) {
-    el.innerHTML = `<div class="empty">Активных постов в наличии пока нет.<br><br>Создайте пост через бота — он сразу появится здесь для быстрого закрытия!</div>`;
+    el.innerHTML = `<div class="empty">Активных постов в наличии пока нет.<br><br>Нажмите «+ Создать пост» сверху, чтобы выложить товар в канал!</div>`;
     return;
   }
   el.innerHTML = activePosts.map(p => {
+    const parsed = parsePostCard(p.text);
+    const priceHtml = parsed.price ? `<span class="post-price">${esc(parsed.price)}</span>` : '';
     const linked = p.linked_item_name ? `<span class="badge badge-active">🔗 ${esc(p.linked_item_name)}</span>` : '';
     return `
       <div class="post-card">
-        <div class="post-text">${esc(p.text)}</div>
+        <div>
+          <div class="post-head">
+            <div class="post-title">${esc(parsed.title)}</div>
+            ${priceHtml}
+          </div>
+          <div class="post-body" style="margin-top:8px">${esc(parsed.body)}</div>
+        </div>
         <div class="post-foot">
-          <div>${linked}</div>
+          <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+            <span class="status-live">● В наличии</span>
+            ${linked}
+          </div>
           <button class="btn btn-red btn-sm" onclick="openMarkPostSold(${p.id}, ${p.linked_item_id || 'null'})">❌ ПРОДАНО</button>
         </div>
       </div>
@@ -575,37 +717,6 @@ function renderPosts() {
   }).join('');
 }
 
-function copyTracks(shipId) {
-  const s = STATE.shipments.find(x => x.id === shipId);
-  if (!s) return;
-  const lines = [`📦 ${s.name}`, ''];
-  s.items.forEach((it, i) => lines.push(`${i+1}. ${it.name} — ${it.track_number || 'без трека'}`));
-  copyText(lines.join('\\n'));
-}
-
-function openModal(html) {
-  document.getElementById('modalBody').innerHTML = html;
-  document.getElementById('modalBg').classList.add('open');
-}
-function closeModal() {
-  document.getElementById('modalBg').classList.remove('open');
-}
-
-function openNewShipment() {
-  openModal(`
-    <h3>📦 Новая отправка</h3>
-    <div class="field"><label>Название отправки</label><input id="mShipName" placeholder="Например: Ноябрь №2"></div>
-    <div class="modal-btns">
-      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
-      <button class="btn btn-orange" onclick="submitNewShipment()">Создать</button>
-    </div>
-  `);
-}
-async function submitNewShipment() {
-  const name = document.getElementById('mShipName').value.trim();
-  if (!name) return;
-  await api('/api/shipments', 'POST', { name });
-  closeModal(); toast('Отправка создана'); 
 function renderDirect() {
   const q = (document.getElementById('directSearch').value || '').toLowerCase();
   const items = (STATE.direct_items || []).filter(it =>
@@ -613,7 +724,7 @@ function renderDirect() {
   );
   const el = document.getElementById('directList');
   if (!items.length) {
-    el.innerHTML = `<div class="empty">Своих товаров вне отправок пока нет.<br><br>Нажмите «+ Добавить свой товар», чтобы вести учёт.</div>`;
+    el.innerHTML = `<div class="empty">Своих товаров пока нет.<br><br>Нажмите «+ Свой товар», чтобы добавить.</div>`;
     return;
   }
   el.innerHTML = items.map(it => {
@@ -641,13 +752,28 @@ function renderDirect() {
   }).join('');
 }
 
-function compressImage(file) {
+function copyTracks(shipId) {
+  const s = STATE.shipments.find(x => x.id === shipId);
+  if (!s) return;
+  const lines = [`📦 ${s.name}`, ''];
+  s.items.forEach((it, i) => lines.push(`${i+1}. ${it.name} — ${it.track_number || 'без трека'}`));
+  copyText(lines.join('\\n'));
+}
+
+function openModal(html) {
+  document.getElementById('modalBody').innerHTML = html;
+  document.getElementById('modalBg').classList.add('open');
+}
+function closeModal() {
+  document.getElementById('modalBg').classList.remove('open');
+}
+
+function compressImage(file, maxSide=700, quality=0.72) {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = (e) => {
       const img = new Image();
       img.onload = () => {
-        const maxSide = 700;
         let w = img.width, h = img.height;
         if (w > maxSide || h > maxSide) {
           if (w > h) { h = Math.round(h * maxSide / w); w = maxSide; }
@@ -656,7 +782,7 @@ function compressImage(file) {
         const c = document.createElement('canvas');
         c.width = w; c.height = h;
         c.getContext('2d').drawImage(img, 0, 0, w, h);
-        resolve(c.toDataURL('image/jpeg', 0.72));
+        resolve(c.toDataURL('image/jpeg', quality));
       };
       img.src = e.target.result;
     };
@@ -664,62 +790,57 @@ function compressImage(file) {
   });
 }
 
-function openNewDirect() {
+function openNewPost() {
+  const opts = (STATE.unsold_my || []).map(it =>
+    `<option value="${it.id}">${esc(it.name)} (${esc(it.shipment_name)})</option>`
+  ).join('');
   openModal(`
-    <h3>🏷 Добавить свой товар</h3>
-    <div class="field"><label>Название</label><input id="dTitle" placeholder="Nintendo 3DS XL"></div>
-    <div class="field"><label>Состояние</label><input id="dCond" placeholder="9/10 (отличное)"></div>
-    <div class="field"><label>Цена захода (₽)</label><input id="dBuy" placeholder="8500"></div>
-    <div class="field">
-      <label>Фото (необязательно)</label>
-      <div style="background:rgba(255,90,31,.12);border:1px solid rgba(255,90,31,.4);color:#fdba74;padding:8px 10px;border-radius:10px;font-size:12px;margin-bottom:6px">
-        ⚠️ Если фото не нужно — лучше не добавляйте, чтобы не грузить сервер и бота.
-      </div>
-      <input type="file" id="dPhoto" accept="image/*">
+    <h3>📝 Новый пост в канал</h3>
+    <div class="field"><label>Фото товара (до 10 шт.)</label><input type="file" id="pPhotos" accept="image/*" multiple></div>
+    <div class="field"><label>Текст поста (с #НАЛИЧИЕ и ценой)</label>
+      <textarea id="pText" placeholder="🎮 Nintendo 3DS XL&#10;• Состояние: 9/10&#10;• Комплект: консоль, кабель, SD 32GB&#10;#НАЛИЧИЕ&#10;• Цена: 14.990 ₽"></textarea>
+    </div>
+    <div class="field"><label>Привязать к товару в CRM (для учёта прибыли)</label>
+      <select id="pLink"><option value="">— Без привязки —</option>${opts}</select>
     </div>
     <div class="modal-btns">
       <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
-      <button class="btn btn-orange" onclick="submitNewDirect()">Сохранить</button>
+      <button class="btn btn-orange" id="pSendBtn" onclick="submitNewPost()">✅ Добавить КУПИТЬ✅ и выложить</button>
     </div>
   `);
 }
-
-async function submitNewDirect() {
-  const title = document.getElementById('dTitle').value.trim();
-  const condition = document.getElementById('dCond').value.trim();
-  const buy_price = document.getElementById('dBuy').value.trim();
-  if (!title) return;
-  let photo_b64 = '';
-  const f = document.getElementById('dPhoto').files[0];
-  if (f) photo_b64 = await compressImage(f);
-  await api('/api/direct', 'POST', { title, condition, buy_price, photo_b64 });
-  closeModal(); toast('Товар добавлен'); loadAll();
+async function submitNewPost() {
+  const files = Array.from(document.getElementById('pPhotos').files || []).slice(0, 10);
+  const text = document.getElementById('pText').value.trim();
+  const linked_item_id = document.getElementById('pLink').value || null;
+  if (!files.length || !text) { toast('Добавьте фото и текст поста'); return; }
+  const btn = document.getElementById('pSendBtn');
+  btn.disabled = true; btn.textContent = 'Публикация...';
+  try {
+    const photos = [];
+    for (const f of files) photos.push(await compressImage(f, 1280, 0.82));
+    await api('/api/posts', 'POST', { photos, text, linked_item_id });
+    closeModal(); toast('Пост опубликован в канал!'); loadAll();
+  } catch (e) {
+    toast(e.message); btn.disabled = false; btn.textContent = '✅ Добавить КУПИТЬ✅ и выложить';
+  }
 }
 
-function openSellDirect(id, title) {
+function openNewShipment() {
   openModal(`
-    <h3>💰 Продажа товара</h3>
-    <p style="font-size:13px;color:var(--muted);margin-top:0">${esc(title)}</p>
-    <div class="field"><label>Цена продажи (₽)</label><input id="dSellPrice" placeholder="14500"></div>
+    <h3>📦 Новая отправка</h3>
+    <div class="field"><label>Название отправки</label><input id="mShipName" placeholder="Например: Ноябрь №2"></div>
     <div class="modal-btns">
       <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
-      <button class="btn btn-orange" onclick="submitSellDirect(${id})">Сохранить</button>
+      <button class="btn btn-orange" onclick="submitNewShipment()">Создать</button>
     </div>
   `);
 }
-async function submitSellDirect(id) {
-  const sell_price = document.getElementById('dSellPrice').value.trim();
-  if (!sell_price) return;
-  await api(`/api/direct/${id}/sell`, 'POST', { sell_price });
-  closeModal(); toast('Продажа записана'); loadAll();
-}
-async function delDirect(id) {
-  if (!confirm('Удалить товар?')) return;
-  await api(`/api/direct/${id}`, 'DELETE');
-  toast('Удалено'); loadAll();
-}
-
-loadAll();
+async function submitNewShipment() {
+  const name = document.getElementById('mShipName').value.trim();
+  if (!name) return;
+  await api('/api/shipments', 'POST', { name });
+  closeModal(); toast('Отправка создана'); loadAll();
 }
 
 function openAddItem(shipId) {
@@ -733,7 +854,7 @@ function openAddItem(shipId) {
         <option value="client">🧑‍💼 Клиент</option>
       </select>
     </div>
-    <div class="field" id="mOwnerValWrap"><label id="mOwnerValLbl">Цена закупки</label><input id="mItemVal" placeholder="10500 ₽"></div>
+    <div class="field"><label id="mOwnerValLbl">Цена закупки</label><input id="mItemVal" placeholder="10500 ₽"></div>
     <div class="modal-btns">
       <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
       <button class="btn btn-orange" onclick="submitAddItem(${shipId})">Сохранить</button>
@@ -789,7 +910,6 @@ async function submitEditItem(itemId) {
   });
   closeModal(); toast('Обновлено'); loadAll();
 }
-
 async function delItem(itemId) {
   if (!confirm('Удалить этот товар?')) return;
   await api(`/api/items/${itemId}`, 'DELETE');
@@ -852,6 +972,59 @@ async function submitMarkPostSold(postId) {
   closeModal(); toast('Пост обновлён в канале!'); loadAll();
 }
 
+function openNewDirect() {
+  openModal(`
+    <h3>🏷 Добавить свой товар</h3>
+    <div class="field"><label>Название</label><input id="dTitle" placeholder="Nintendo 3DS XL"></div>
+    <div class="field"><label>Состояние</label><input id="dCond" placeholder="9/10 (отличное)"></div>
+    <div class="field"><label>Цена захода (₽)</label><input id="dBuy" placeholder="8500"></div>
+    <div class="field">
+      <label>Фото (необязательно)</label>
+      <div style="background:rgba(255,90,31,.12);border:1px solid rgba(255,90,31,.4);color:#fdba74;padding:8px 10px;border-radius:10px;font-size:12px;margin-bottom:6px">
+        ⚠️ Если фото не нужно — лучше не добавляйте, чтобы не грузить сервер и бота.
+      </div>
+      <input type="file" id="dPhoto" accept="image/*">
+    </div>
+    <div class="modal-btns">
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitNewDirect()">Сохранить</button>
+    </div>
+  `);
+}
+async function submitNewDirect() {
+  const title = document.getElementById('dTitle').value.trim();
+  const condition = document.getElementById('dCond').value.trim();
+  const buy_price = document.getElementById('dBuy').value.trim();
+  if (!title) return;
+  let photo_b64 = '';
+  const f = document.getElementById('dPhoto').files[0];
+  if (f) photo_b64 = await compressImage(f, 700, 0.72);
+  await api('/api/direct', 'POST', { title, condition, buy_price, photo_b64 });
+  closeModal(); toast('Товар добавлен'); loadAll();
+}
+function openSellDirect(id, title) {
+  openModal(`
+    <h3>💰 Продажа товара</h3>
+    <p style="font-size:13px;color:var(--muted);margin-top:0">${esc(title)}</p>
+    <div class="field"><label>Цена продажи (₽)</label><input id="dSellPrice" placeholder="14500"></div>
+    <div class="modal-btns">
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitSellDirect(${id})">Сохранить</button>
+    </div>
+  `);
+}
+async function submitSellDirect(id) {
+  const sell_price = document.getElementById('dSellPrice').value.trim();
+  if (!sell_price) return;
+  await api(`/api/direct/${id}/sell`, 'POST', { sell_price });
+  closeModal(); toast('Продажа записана'); loadAll();
+}
+async function delDirect(id) {
+  if (!confirm('Удалить товар?')) return;
+  await api(`/api/direct/${id}`, 'DELETE');
+  toast('Удалено'); loadAll();
+}
+
 loadAll();
 </script>
 </body>
@@ -859,7 +1032,8 @@ loadAll();
 
 
 def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Application:
-    app = web.Application()
+    app = web.Application(client_max_size=25 * 1024 * 1024)
+    no_cache = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 
     @web.middleware
     async def auth_mw(request: web.Request, handler):
@@ -875,6 +1049,12 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
     app.middlewares.append(auth_mw)
 
+    def _target_hash(request: web.Request) -> Optional[str]:
+        sess = request["session"]
+        if sess["role"] == "admin_personal":
+            return sess["user_hash"]
+        return deps["get_owner_hash"]()
+
     async def handle_health(_: web.Request) -> web.Response:
         return web.Response(text="OK")
 
@@ -884,8 +1064,12 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         raise resp
 
     async def handle_login_get(_: web.Request) -> web.Response:
-        html = LOGIN_HTML.replace("__LOGO__", _get_logo_html()).replace("__ERR__", "")
-        return web.Response(text=html, content_type="text/html")
+        html = (
+            LOGIN_HTML.replace("__LOGO__", _get_logo_html())
+            .replace("__ERR__", "")
+            .replace("__FALL_JS__", FALLING_BG_JS)
+        )
+        return web.Response(text=html, content_type="text/html", headers=no_cache)
 
     async def handle_login_post(request: web.Request) -> web.Response:
         data = await request.post()
@@ -899,14 +1083,16 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
             resp = web.HTTPFound("/")
             resp.set_cookie(COOKIE_NAME, _admin_token(adm["user_hash"]), httponly=True, max_age=86400 * 30)
             raise resp
-        html = LOGIN_HTML.replace("__LOGO__", _get_logo_html()).replace(
-            "__ERR__", '<div class="err">Неверный пароль</div>'
+        html = (
+            LOGIN_HTML.replace("__LOGO__", _get_logo_html())
+            .replace("__ERR__", '<div class="err">Неверный пароль</div>')
+            .replace("__FALL_JS__", FALLING_BG_JS)
         )
-        return web.Response(text=html, content_type="text/html", status=401)
+        return web.Response(text=html, content_type="text/html", status=401, headers=no_cache)
 
     async def handle_index(_: web.Request) -> web.Response:
-        html = DASHBOARD_HTML.replace("__LOGO__", _get_logo_html())
-        return web.Response(text=html, content_type="text/html")
+        html = DASHBOARD_HTML.replace("__LOGO__", _get_logo_html()).replace("__FALL_JS__", FALLING_BG_JS)
+        return web.Response(text=html, content_type="text/html", headers=no_cache)
 
     async def handle_dashboard(request: web.Request) -> web.Response:
         sess = request["session"]
@@ -925,15 +1111,21 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 "shipments": [],
                 "posts": [],
                 "direct_items": direct_items,
+                "unsold_my": [],
             })
 
         finances = deps["get_crm_finances"]()
         all_ships = []
+        unsold_my = []
         for status in ("active", "archived"):
             for s in deps["get_shipments"](status):
                 sd = dict(s)
-                sd["items"] = [dict(i) for i in deps["get_items"](s["id"])]
+                s_items = [dict(i) for i in deps["get_items"](s["id"])]
+                sd["items"] = s_items
                 all_ships.append(sd)
+                for it in s_items:
+                    if it.get("owner_type") == "my" and not it.get("sold_price"):
+                        unsold_my.append({"id": it["id"], "name": it["name"], "shipment_name": s["name"]})
 
         posts = [dict(p) for p in deps["get_all_posts"]()]
         owner_hash = deps["get_owner_hash"]()
@@ -950,7 +1142,50 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
             "shipments": all_ships,
             "posts": posts,
             "direct_items": direct_items,
+            "unsold_my": unsold_my[:25],
         })
+
+    async def handle_create_post(request: web.Request) -> web.Response:
+        if request["session"]["role"] != "owner":
+            return web.json_response({"error": "Forbidden"}, status=403)
+        channel_id = deps["get_setting"]("channel_id")
+        if not channel_id:
+            return web.json_response({"error": "Сначала подключите канал в боте (⚙️ Канал для постов)"}, status=400)
+        body = await request.json()
+        photos_b64 = body.get("photos", [])[:10]
+        post_text = str(body.get("text", "")).strip()
+        linked_raw = body.get("linked_item_id")
+        linked_item_id = int(linked_raw) if linked_raw else None
+        if not photos_b64 or not post_text:
+            return web.json_response({"error": "Нужны фото и текст"}, status=400)
+
+        files = []
+        for idx, b64 in enumerate(photos_b64):
+            raw_bytes = base64.b64decode(b64.split(",", 1)[1])
+            files.append(BufferedInputFile(raw_bytes, filename=f"photo_{idx}.jpg"))
+
+        buy_kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="КУПИТЬ✅", url="https://t.me/QQHead")]]
+        )
+        try:
+            if len(files) == 1:
+                await bot.send_photo(chat_id=channel_id, photo=files[0])
+            else:
+                await bot.send_media_group(
+                    chat_id=channel_id,
+                    media=[InputMediaPhoto(media=f) for f in files],
+                )
+            sent = await bot.send_message(
+                chat_id=channel_id,
+                text=post_text,
+                parse_mode=None,
+                reply_markup=buy_kb,
+                disable_web_page_preview=True,
+            )
+            deps["save_post"](channel_id, sent.message_id, post_text, "[]", linked_item_id=linked_item_id)
+        except TelegramBadRequest as e:
+            return web.json_response({"error": str(e)}, status=400)
+        return web.json_response({"ok": True})
 
     async def handle_create_shipment(request: web.Request) -> web.Response:
         body = await request.json()
@@ -1032,7 +1267,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 new_text,
                 deps["serialize_entities"](new_entities),
             )
-        except TelegramBadRequest as e:
+        except TelegramBadRequest:
             try:
                 await bot.edit_message_reply_markup(
                     chat_id=post["channel_id"],
@@ -1054,13 +1289,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
         return web.json_response({"ok": True})
 
-
-    def _target_hash(request: web.Request) -> Optional[str]:
-        sess = request["session"]
-        if sess["role"] == "admin_personal":
-            return sess["user_hash"]
-        return deps["get_owner_hash"]()
-
     async def handle_create_direct(request: web.Request) -> web.Response:
         owner_hash = _target_hash(request)
         if not owner_hash:
@@ -1074,7 +1302,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         photo_b64 = str(body.get("photo_b64", "")).strip()
         photo_ref = ""
         if photo_b64.startswith("data:image/"):
-            import uuid
             b64_part = photo_b64.split(",", 1)[1]
             data_dir = os.getenv("DATA_DIR", "/app/data")
             photos_dir = os.path.join(data_dir, "photos") if os.path.isdir(data_dir) else "photos"
@@ -1119,6 +1346,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/login", handle_login_post)
     app.router.add_get("/", handle_index)
     app.router.add_get("/api/dashboard", handle_dashboard)
+    app.router.add_post("/api/posts", handle_create_post)
     app.router.add_post("/api/shipments", handle_create_shipment)
     app.router.add_post("/api/shipments/{id}/arrive", handle_arrive_shipment)
     app.router.add_post("/api/shipments/{id}/items", handle_add_item)
