@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 from typing import Any
@@ -77,7 +78,7 @@ def detect_quality(title: str) -> str:
 def extract_price_num(text: str) -> float:
     if not text:
         return 0.0
-    cleaned = text.replace("\xa0", "").replace(" ", "")
+    cleaned = str(text).replace("\xa0", "").replace(" ", "")
     m = re.search(r"(\d{2,7}(?:[.,]\d{1,2})?)", cleaned)
     if not m:
         return 0.0
@@ -89,13 +90,59 @@ def extract_price_num(text: str) -> float:
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> tuple[int, str]:
     try:
-        async with session.get(url, headers=HEADERS, timeout=aiohttp.ClientTimeout(total=9)) as resp:
+        timeout = aiohttp.ClientTimeout(total=6, connect=3)
+        async with session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True) as resp:
             txt = await resp.text(errors="ignore")
             logger.info(f"Parts fetch {url} -> HTTP {resp.status}, len={len(txt)}")
             return resp.status, txt
     except Exception as e:
         logger.warning(f"Parts fetch error {url}: {e}")
         return 0, ""
+
+
+def _walk_json_products(obj: Any, base_url: str, source_name: str, out: list[dict[str, Any]], seen: set[str], limit: int) -> None:
+    if len(out) >= limit:
+        return
+    if isinstance(obj, list):
+        for item in obj:
+            _walk_json_products(item, base_url, source_name, out, seen, limit)
+            if len(out) >= limit:
+                return
+    elif isinstance(obj, dict):
+        title = obj.get("name") or obj.get("title") or obj.get("NAME")
+        price_raw = obj.get("price") or obj.get("PRICE") or obj.get("minPrice") or obj.get("cost")
+        if isinstance(price_raw, dict):
+            price_raw = price_raw.get("value") or price_raw.get("price") or price_raw.get("amount")
+        slug = obj.get("url") or obj.get("DETAIL_PAGE_URL") or obj.get("slug") or obj.get("link") or obj.get("href")
+        if title and price_raw is not None and slug:
+            p_val = extract_price_num(str(price_raw))
+            t_str = " ".join(str(title).split())
+            if p_val > 0 and len(t_str) >= 6:
+                href = str(slug).strip()
+                if not href.startswith("http") and not href.startswith("/"):
+                    href = f"/catalog/{href}"
+                full_url = urljoin(base_url, href)
+                if full_url not in seen:
+                    seen.add(full_url)
+                    avail = obj.get("available")
+                    qty = obj.get("quantity")
+                    in_stock = True
+                    if avail is False or qty == 0:
+                        in_stock = False
+                    out.append({
+                        "source": source_name,
+                        "title": t_str[:115],
+                        "quality": detect_quality(t_str),
+                        "price": p_val,
+                        "in_stock": in_stock,
+                        "url": full_url,
+                    })
+                    return
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                _walk_json_products(v, base_url, source_name, out, seen, limit)
+                if len(out) >= limit:
+                    return
 
 
 def _parse_cards(html: str, base_url: str, source_name: str, limit: int = 6) -> list[dict[str, Any]]:
@@ -105,16 +152,18 @@ def _parse_cards(html: str, base_url: str, source_name: str, limit: int = 6) -> 
     results: list[dict[str, Any]] = []
     seen_urls: set[str] = set()
 
-    # 1. Пробуем стандартные классы карточек
+    # 1. Пробуем стандартные и Bitrix/Aspro классы карточек
     candidates = soup.select(
-        ".catalog-item, .product-item, .item_block, .catalog_item, .catalog-block-item, "
-        ".product-card, .goods-item, .search-item, [data-entity='item'], .item-card, .bx_catalog_item"
+        ".catalog_item_wrapp, .catalog-block-item, .item_block, .catalog_item, .catalog-item, "
+        ".product-item, .product-item-container, .product-card, .goods-item, .search-item, "
+        "[data-entity='item'], .item-card, .bx_catalog_item, .list_item_wrapp, .table-view__item, "
+        "[class*='ProductCard'], [class*='product-card']"
     )
 
-    # 2. Универсальный fallback: ищем родительские блоки вокруг ссылок /catalog/
+    # 2. Универсальный fallback: ищем родительские блоки вокруг ссылок /catalog/ или /product/
     if not candidates:
         blocks = []
-        for a in soup.select("a[href*='/catalog/']"):
+        for a in soup.select("a[href*='/catalog/'], a[href*='/product/']"):
             href = a.get("href") or ""
             if href.count("/") < 3:
                 continue
@@ -124,7 +173,10 @@ def _parse_cards(html: str, base_url: str, source_name: str, limit: int = 6) -> 
         candidates = blocks
 
     for card in candidates:
-        a = card.select_one("a[href*='/catalog/'], a[href*='/product/'], h3 a, h4 a, a.title, a.name, a[href]")
+        a = card.select_one(
+            "a[href*='/catalog/'], a[href*='/product/'], .item-title a, .product-title a, "
+            "h3 a, h4 a, a.title, a.name, a[href]"
+        )
         if not a:
             continue
         href = (a.get("href") or "").strip()
@@ -134,18 +186,34 @@ def _parse_cards(html: str, base_url: str, source_name: str, limit: int = 6) -> 
         if full_url in seen_urls:
             continue
 
-        title_el = card.select_one(".item-title, .product-title, .name, .title, h3, h4, .bx_catalog_item_title") or a
+        title_el = card.select_one(
+            ".item-title, .product-title, .name, .title, h3, h4, .bx_catalog_item_title, [class*='title']"
+        ) or a
         title = " ".join(title_el.get_text(" ", strip=True).split())
-        if len(title) < 6 or title.lower() in ("подробнее", "в корзину", "купить"):
+        if len(title) < 6 or title.lower() in ("подробнее", "в корзину", "купить", "быстрый просмотр", "сравнить"):
             continue
 
-        price_el = card.select_one(".price, .product-price, .item-price, .cost, .bx_price, [class*='price']")
-        price_text = price_el.get_text(" ", strip=True) if price_el else ""
-        if not price_text:
+        # Ищем цену среди всех возможных элементов и атрибутов (без залипания на пустом первом блоке)
+        price_val = 0.0
+        for attr in ("data-price", "data-product-price"):
+            if card.get(attr):
+                price_val = extract_price_num(str(card.get(attr)))
+                if price_val > 0:
+                    break
+        if price_val <= 0:
+            meta_p = card.select_one("meta[itemprop='price']")
+            if meta_p and meta_p.get("content"):
+                price_val = extract_price_num(str(meta_p.get("content")))
+        if price_val <= 0:
+            for pel in card.select(".price_value, .price, .product-price, .item-price, .cost, .bx_price, [class*='price'], [class*='Price']"):
+                cand = extract_price_num(pel.get_text(" ", strip=True))
+                if cand > 0:
+                    price_val = cand
+                    break
+        if price_val <= 0:
             m_p = re.search(r"(\d[\d\s\xa0]{1,7})\s*(?:₽|руб|р\.)", card.get_text(" ", strip=True), re.I)
-            price_text = m_p.group(0) if m_p else ""
-
-        price_val = extract_price_num(price_text)
+            if m_p:
+                price_val = extract_price_num(m_p.group(1))
         if price_val <= 0:
             continue
 
@@ -166,6 +234,20 @@ def _parse_cards(html: str, base_url: str, source_name: str, limit: int = 6) -> 
         if len(results) >= limit:
             break
 
+    # 3. Если HTML-карточки не нашлись (SPA / Next.js / JSON-LD) — парсим встроенный JSON
+    if not results:
+        for sc in soup.select("script#__NEXT_DATA__, script[type='application/ld+json']"):
+            raw_json = (sc.string or sc.get_text() or "").strip()
+            if not raw_json:
+                continue
+            try:
+                data = json.loads(raw_json)
+                _walk_json_products(data, base_url, source_name, results, seen_urls, limit)
+            except Exception:
+                continue
+            if len(results) >= limit:
+                break
+
     return results
 
 
@@ -173,36 +255,44 @@ async def search_parts_all(raw_query: str) -> dict[str, Any]:
     norm_query = normalize_query(raw_query)
     q_enc = quote_plus(norm_query)
     urls = {
-        "master_mobile": f"https://master-mobile.ru/catalog/?q={q_enc}",
+        "master_mobile": f"https://master-mobile.ru/catalog/?q={q_enc}&s=%D0%9F%D0%BE%D0%B8%D1%81%D0%BA",
         "moba": f"https://moba.ru/catalog/?q={q_enc}",
         "mems": f"https://memstech.ru/search?q={q_enc}",
     }
 
     async with aiohttp.ClientSession() as session:
-        (mm_st, mm_html), (moba_st, moba_html), (mems_st, mems_html) = await asyncio.gather(
+        # Запускаем все основные и запасные URL параллельно, чтобы поиск не зависал
+        fetches = await asyncio.gather(
             _fetch_html(session, urls["master_mobile"]),
+            _fetch_html(session, f"https://master-mobile.ru/search/?q={q_enc}"),
             _fetch_html(session, urls["moba"]),
+            _fetch_html(session, f"https://moba.ru/search/?q={q_enc}"),
             _fetch_html(session, urls["mems"]),
+            _fetch_html(session, f"https://memstech.ru/catalog?q={q_enc}"),
+            return_exceptions=True,
         )
-        # Если на master-mobile /catalog/?q= пусто — пробуем /search/?q=
-        mm_items = _parse_cards(mm_html, "https://master-mobile.ru", "Master Mobile")
-        if not mm_items and mm_st == 200:
-            alt_st, alt_html = await _fetch_html(session, f"https://master-mobile.ru/search/?q={q_enc}")
-            if alt_st == 200:
-                mm_items = _parse_cards(alt_html, "https://master-mobile.ru", "Master Mobile")
 
-        moba_items = _parse_cards(moba_html, "https://moba.ru", "Moba")
-        if not moba_items and moba_st == 200:
-            alt_st, alt_html = await _fetch_html(session, f"https://moba.ru/search/?q={q_enc}")
-            if alt_st == 200:
-                moba_items = _parse_cards(alt_html, "https://moba.ru", "Moba")
+    def _safe_res(idx: int) -> tuple[int, str]:
+        val = fetches[idx]
+        if isinstance(val, tuple) and len(val) == 2:
+            return val
+        return (0, "")
 
-        mems_items = _parse_cards(mems_html, "https://memstech.ru", "MEMS")
+    mm_st1, mm_h1 = _safe_res(0)
+    mm_st2, mm_h2 = _safe_res(1)
+    moba_st1, moba_h1 = _safe_res(2)
+    moba_st2, moba_h2 = _safe_res(3)
+    mems_st1, mems_h1 = _safe_res(4)
+    mems_st2, mems_h2 = _safe_res(5)
+
+    mm_items = _parse_cards(mm_h1, "https://master-mobile.ru", "Master Mobile") or _parse_cards(mm_h2, "https://master-mobile.ru", "Master Mobile")
+    moba_items = _parse_cards(moba_h1, "https://moba.ru", "Moba") or _parse_cards(moba_h2, "https://moba.ru", "Moba")
+    mems_items = _parse_cards(mems_h1, "https://memstech.ru", "MEMS") or _parse_cards(mems_h2, "https://memstech.ru", "MEMS")
 
     statuses = {
-        "Master Mobile": mm_st,
-        "Moba": moba_st,
-        "MEMS": mems_st,
+        "Master Mobile": mm_st1 or mm_st2,
+        "Moba": moba_st1 or moba_st2,
+        "MEMS": mems_st1 or mems_st2,
     }
 
     return {

@@ -123,7 +123,7 @@ def generate_act_pdf(order: dict[str, Any], act_type: str, logo_b64: str = "") -
         pdf.set_fill_color(248, 250, 252)
         pdf.set_draw_color(216, 222, 230)
         pdf.set_text_color(17, 17, 19)
-        x0, y0 = pdf.get_x(), pdf.get_y()
+        y0 = pdf.get_y()
         pdf.set_xy(14, y0)
         pdf.multi_cell(54, 7, label, border=1, fill=True)
         h_left = pdf.get_y() - y0
@@ -140,7 +140,6 @@ def generate_act_pdf(order: dict[str, Any], act_type: str, logo_b64: str = "") -
         draw_kv_row("Серийный № / IMEI", str(order.get("imei_sn") or "—"))
         draw_kv_row("Неисправность", str(order.get("issue_desc") or "—"))
         draw_kv_row("Внешний вид", str(order.get("appearance") or "Б/у, следы эксплуатации"))
-        draw_kv_row("Комплектация", str(order.get("completeness") or "Только устройство"))
         draw_kv_row("Пароль / Примечание", str(order.get("passcode_note") or "—"))
 
         pdf.ln(5)
@@ -170,8 +169,9 @@ def generate_act_pdf(order: dict[str, Any], act_type: str, logo_b64: str = "") -
     else:
         draw_kv_row("Заказчик", f"{order.get('client_name') or '—'} • Тел.: {order.get('client_phone') or '—'}")
         draw_kv_row("Устройство", f"{order.get('device_model') or '—'} • IMEI: {order.get('imei_sn') or '—'}")
-        warranty = int(order.get("warranty_days") or 30)
-        draw_kv_row("Гарантия", f"{warranty} дней (при отсутствии механических и жидкостных повреждений)")
+        warranty = int(order.get("warranty_days") or 0)
+        warr_txt = f"{warranty} дней (при отсутствии механических и жидкостных повреждений)" if warranty > 0 else "Без гарантии"
+        draw_kv_row("Гарантия", warr_txt)
 
         pdf.ln(4)
         pdf.set_fill_color(17, 17, 19)
@@ -186,7 +186,6 @@ def generate_act_pdf(order: dict[str, Any], act_type: str, logo_b64: str = "") -
         pdf.set_font(fam, "", 9.5)
         service_txt = order.get("service_name") or order.get("issue_desc") or "Ремонт устройства"
         tot = _fmt_rub(order.get("total_price", 0))
-        y0 = pdf.get_y()
         pdf.set_x(14)
         pdf.cell(12, 8, "1", border=1)
         pdf.cell(126, 8, str(service_txt)[:68], border=1)
@@ -207,7 +206,7 @@ def generate_act_pdf(order: dict[str, Any], act_type: str, logo_b64: str = "") -
             182,
             4.8,
             "Устройство проверено Заказчиком при получении (сенсор, изображение, зарядка, звук, связь). "
-            "Претензий по внешнему виду, комплектации и качеству выполненных работ Заказчик не имеет. "
+            "Претензий по внешнему виду и качеству выполненных работ Заказчик не имеет. "
             "Гарантия не распространяется на устройства со следами ударов, сколов, попадания влаги и вскрытия третьими лицами.",
         )
         left_sign = "Принял (Заказчик): ______________________"
