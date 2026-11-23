@@ -17,14 +17,26 @@ WEB_PASSWORD = os.getenv("WEB_PASSWORD", "").strip()
 COOKIE_NAME = "qcrm_auth"
 
 
-def _auth_token() -> str:
-    return hashlib.sha256(f"qcrm:{WEB_PASSWORD}".encode("utf-8")).hexdigest()
+def _owner_token() -> str:
+    return "owner:" + hashlib.sha256(f"qcrm_owner:{WEB_PASSWORD}".encode("utf-8")).hexdigest()
 
 
-def _is_authorized(request: web.Request) -> bool:
-    if not WEB_PASSWORD:
-        return True
-    return request.cookies.get(COOKIE_NAME) == _auth_token()
+def _admin_token(user_hash: str) -> str:
+    sig = hashlib.sha256(f"qcrm_adm:{user_hash}:{WEB_PASSWORD}".encode("utf-8")).hexdigest()[:24]
+    return f"adm:{user_hash}:{sig}"
+
+
+def _get_session(request: web.Request) -> Optional[dict]:
+    cookie = request.cookies.get(COOKIE_NAME, "")
+    if cookie == _owner_token():
+        return {"role": "owner"}
+    if cookie.startswith("adm:"):
+        parts = cookie.split(":", 2)
+        if len(parts) == 3 and cookie == _admin_token(parts[1]):
+            return {"role": "admin_personal", "user_hash": parts[1]}
+    if not WEB_PASSWORD and not cookie:
+        return {"role": "owner"}
+    return None
 
 
 def _get_logo_html() -> str:
@@ -34,16 +46,8 @@ def _get_logo_html() -> str:
             with open(fname, "rb") as f:
                 b64 = base64.b64encode(f.read()).decode("ascii")
             return f'<img src="data:image/{ext};base64,{b64}" alt="QCRM" class="logo-img">'
-    # Фирменный SVG-значок QHEAD в чёрно-оранжевых тонах
-    return """
-    <svg class="logo-svg" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
-      <rect x="2" y="2" width="60" height="60" rx="14" fill="#111113" stroke="#FF5A1F" stroke-width="3"/>
-      <path d="M16 14H40C42 14 43 16 42 18C39 23 39 29 44 29C49 29 52 33 52 37C52 42 48 45 43 45C40 45 39 48 41 51H16V37C24 37 32 34 35 30C31 27 23 26 16 26V14Z" fill="#FF5A1F"/>
-      <path d="M15 28C22 28 29 30 33 33C29 36 22 38 15 38V28Z" fill="#FFFFFF"/>
-      <circle cx="24" cy="33" r="3.5" fill="#111113"/>
-    </svg>
-    """
-
+    b64_default = "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"
+    return f'<img src="data:image/jpeg;base64,{b64_default}" alt="QCRM" class="logo-img">' 
 
 LOGIN_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -52,21 +56,64 @@ LOGIN_HTML = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
 <title>QCRM — Вход</title>
 <style>
-  :root { --bg:#09090b; --card:#141417; --border:#27272a; --orange:#ff5a1f; --text:#f4f4f5; --muted:#a1a1aa; }
+  :root { --bg:#070709; --border:rgba(255,255,255,.12); --orange:#ff5a1f; --text:#f4f4f5; --muted:#a1a1aa; }
   * { box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
-  body { margin:0; background:var(--bg); color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center; padding:20px; }
-  .box { width:100%; max-width:360px; background:var(--card); border:1px solid var(--border); border-radius:20px; padding:28px; text-align:center; box-shadow:0 20px 50px rgba(0,0,0,.6); }
-  .logo-svg,.logo-img { width:56px; height:56px; border-radius:14px; object-fit:cover; margin-bottom:12px; }
-  h1 { margin:0 0 6px; font-size:24px; letter-spacing:.5px; }
+  body {
+    margin:0; background:radial-gradient(circle at 20% 20%, rgba(255,90,31,.16), transparent 45%),
+    radial-gradient(circle at 80% 80%, rgba(255,90,31,.12), transparent 50%), var(--bg);
+    color:var(--text); min-height:100vh; display:flex; align-items:center; justify-content:center;
+    padding:20px; overflow:hidden; position:relative;
+  }
+  .bg-fall { position:fixed; inset:0; pointer-events:none; overflow:hidden; z-index:0; }
+  .fall-item {
+    position:absolute; top:-80px; opacity:0; will-change:transform,opacity;
+    animation:fallDown linear infinite;
+    filter:drop-shadow(0 0 8px rgba(255,90,31,.15));
+  }
+  @keyframes fallDown {
+    0% { transform:translate3d(0,-80px,0) rotate(0deg); opacity:0; }
+    12% { opacity:.14; }
+    85% { opacity:.12; }
+    100% { transform:translate3d(24px,112vh,0) rotate(320deg); opacity:0; }
+  }
+  @keyframes cardIn {
+    from { opacity:0; transform:translateY(18px) scale(.97); }
+    to { opacity:1; transform:translateY(0) scale(1); }
+  }
+  .box {
+    position:relative; z-index:2; width:100%; max-width:360px;
+    background:rgba(20,20,24,.62);
+    backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+    border:1px solid var(--border);
+    box-shadow:0 24px 60px rgba(0,0,0,.65), inset 0 1px 0 rgba(255,255,255,.08);
+    border-radius:24px; padding:30px 26px; text-align:center;
+    animation:cardIn .45s cubic-bezier(.16,1,.3,1);
+  }
+  .logo-svg,.logo-img {
+    width:64px; height:64px; border-radius:16px; object-fit:cover; margin-bottom:12px;
+    border:1px solid rgba(255,90,31,.45); box-shadow:0 8px 24px rgba(255,90,31,.25);
+  }
+  h1 { margin:0 0 6px; font-size:26px; letter-spacing:.6px; font-weight:800; }
   h1 span { color:var(--orange); }
-  p { margin:0 0 20px; color:var(--muted); font-size:14px; }
-  input { width:100%; padding:13px 14px; border-radius:12px; border:1px solid var(--border); background:#0d0d10; color:#fff; font-size:16px; outline:none; margin-bottom:12px; }
-  input:focus { border-color:var(--orange); }
-  button { width:100%; padding:13px; border:none; border-radius:12px; background:var(--orange); color:#fff; font-weight:700; font-size:15px; cursor:pointer; }
-  .err { color:#ef4444; font-size:13px; margin-bottom:10px; }
+  p { margin:0 0 22px; color:var(--muted); font-size:13px; }
+  input {
+    width:100%; padding:13px 15px; border-radius:13px; border:1px solid rgba(255,255,255,.12);
+    background:rgba(10,10,13,.65); color:#fff; font-size:16px; outline:none; margin-bottom:14px;
+    transition:border-color .2s, box-shadow .2s;
+  }
+  input:focus { border-color:var(--orange); box-shadow:0 0 0 3px rgba(255,90,31,.2); }
+  button {
+    width:100%; padding:13px; border:none; border-radius:13px;
+    background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff;
+    font-weight:700; font-size:15px; cursor:pointer;
+    box-shadow:0 10px 25px rgba(255,90,31,.3); transition:transform .15s, box-shadow .2s;
+  }
+  button:active { transform:scale(.97); }
+  .err { color:#fca5a5; background:rgba(239,68,68,.15); border:1px solid rgba(239,68,68,.3); padding:8px; border-radius:10px; font-size:13px; margin-bottom:12px; }
 </style>
 </head>
 <body>
+  <div class="bg-fall" id="bgFall"></div>
   <form class="box" method="post" action="/login">
     __LOGO__
     <h1>Q<span>CRM</span></h1>
@@ -75,9 +122,28 @@ LOGIN_HTML = """<!DOCTYPE html>
     <input type="password" name="password" placeholder="Пароль доступа" required autofocus>
     <button type="submit">Войти</button>
   </form>
+<script>
+(function(){
+  const icons = [
+    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.5"><rect x="6" y="2" width="12" height="20" rx="2.5"/><line x1="10" y1="18" x2="14" y2="18"/></svg>',
+    '<svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><rect x="2" y="6" width="20" height="12" rx="4"/><path d="M6 12h4M8 10v4"/><circle cx="15.5" cy="10.5" r="1"/><circle cx="17.5" cy="12.5" r="1"/></svg>',
+    '<svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#ff5a1f" stroke-width="1.4"><rect x="3" y="4" width="18" height="16" rx="2"/><line x1="3" y1="12" x2="21" y2="12"/><rect x="7" y="6" width="10" height="4" rx="1"/><rect x="7" y="14" width="10" height="4" rx="1"/></svg>',
+    '<svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#ffffff" stroke-width="1.4"><path d="M21 8l-9-5-9 5v8l9 5 9-5V8z"/><path d="M3.3 7L12 12l8.7-5M12 22V12"/></svg>'
+  ];
+  const wrap = document.getElementById('bgFall');
+  for (let i = 0; i < 16; i++) {
+    const d = document.createElement('div');
+    d.className = 'fall-item';
+    d.innerHTML = icons[i % icons.length];
+    d.style.left = ((i * 6.5 + (i % 3) * 2) % 94) + '%';
+    d.style.animationDuration = (11 + (i % 5) * 2.4) + 's';
+    d.style.animationDelay = (-1 * (i * 1.7)) + 's';
+    wrap.appendChild(d);
+  }
+})();
+</script>
 </body>
 </html>"""
-
 
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
@@ -87,43 +153,78 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 <title>QCRM — QHEAD Mobile</title>
 <style>
   :root {
-    --bg: #09090b;
-    --surface: #121215;
-    --card: #18181c;
-    --card-2: #1f1f25;
-    --border: #2a2a32;
+    --bg: #070709;
+    --surface: rgba(20, 20, 25, .72);
+    --card: rgba(24, 24, 30, .68);
+    --card-2: rgba(34, 34, 42, .65);
+    --border: rgba(255, 255, 255, .09);
     --orange: #ff5a1f;
-    --orange-soft: rgba(255,90,31,.14);
+    --orange-soft: rgba(255,90,31,.15);
     --green: #22c55e;
-    --green-soft: rgba(34,197,94,.14);
+    --green-soft: rgba(34,197,94,.15);
     --red: #ef4444;
-    --red-soft: rgba(239,68,68,.14);
-    --blue: #3b82f6;
+    --red-soft: rgba(239,68,68,.15);
     --text: #f4f4f5;
     --muted: #a1a1aa;
   }
   * { box-sizing:border-box; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; }
-  body { margin:0; background:var(--bg); color:var(--text); padding-bottom:60px; }
+  body {
+    margin:0; color:var(--text); padding-bottom:70px; min-height:100vh;
+    background:
+      radial-gradient(circle at 12% 8%, rgba(255,90,31,.14), transparent 38%),
+      radial-gradient(circle at 88% 32%, rgba(255,90,31,.09), transparent 42%),
+      var(--bg);
+  }
+  @keyframes fadeUp {
+    from { opacity:0; transform:translateY(12px); }
+    to { opacity:1; transform:translateY(0); }
+  }
+  @keyframes modalIn {
+    from { opacity:0; transform:scale(.95) translateY(8px); }
+    to { opacity:1; transform:scale(1) translateY(0); }
+  }
+  @keyframes pulseDot {
+    0%, 100% { opacity:1; transform:scale(1); }
+    50% { opacity:.45; transform:scale(1.3); }
+  }
   .topbar {
     position:sticky; top:0; z-index:30;
-    background:rgba(12,12,15,.92); backdrop-filter:blur(12px);
+    background:rgba(12,12,16,.76);
+    backdrop-filter:blur(18px); -webkit-backdrop-filter:blur(18px);
     border-bottom:1px solid var(--border);
     padding:12px 16px; display:flex; align-items:center; justify-content:space-between; gap:12px;
   }
   .brand { display:flex; align-items:center; gap:10px; }
-  .logo-svg,.logo-img { width:38px; height:38px; border-radius:10px; object-fit:cover; flex-shrink:0; }
-  .brand-title { font-weight:800; font-size:20px; letter-spacing:.5px; line-height:1.1; }
+  .logo-svg,.logo-img {
+    width:40px; height:40px; border-radius:11px; object-fit:cover; flex-shrink:0;
+    border:1px solid rgba(255,90,31,.4); box-shadow:0 4px 16px rgba(255,90,31,.2);
+  }
+  .brand-title { font-weight:800; font-size:20px; letter-spacing:.5px; line-height:1.1; display:flex; align-items:center; gap:7px; }
   .brand-title span { color:var(--orange); }
+  .live-dot { width:7px; height:7px; border-radius:50%; background:var(--green); display:inline-block; animation:pulseDot 2s infinite; }
   .brand-sub { font-size:11px; color:var(--muted); letter-spacing:.8px; text-transform:uppercase; }
-  .tabs { display:flex; gap:8px; padding:12px 16px 4px; max-width:1160px; margin:0 auto; overflow-x:auto; }
+  .tabs { display:flex; gap:8px; padding:14px 16px 4px; max-width:1160px; margin:0 auto; overflow-x:auto; }
   .tab {
     border:1px solid var(--border); background:var(--surface); color:var(--muted);
+    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
     padding:9px 15px; border-radius:12px; font-weight:600; font-size:14px; cursor:pointer; white-space:nowrap;
+    transition:transform .14s, background .2s, color .2s, border-color .2s;
   }
-  .tab.active { background:var(--orange); color:#fff; border-color:var(--orange); }
+  .tab:active { transform:scale(.96); }
+  .tab.active {
+    background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff; border-color:transparent;
+    box-shadow:0 6px 20px rgba(255,90,31,.28);
+  }
   .wrap { max-width:1160px; margin:0 auto; padding:12px 16px; }
-  .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(165px,1fr)); gap:10px; margin-bottom:18px; }
-  .kpi { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px; }
+  .kpi-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:10px; margin-bottom:18px; }
+  .kpi {
+    background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px;
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    box-shadow:inset 0 1px 0 rgba(255,255,255,.05);
+    animation:fadeUp .35s ease backwards;
+    transition:transform .18s, border-color .2s;
+  }
+  .kpi:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
   .kpi-label { font-size:12px; color:var(--muted); margin-bottom:6px; }
   .kpi-val { font-size:20px; font-weight:800; }
   .kpi-val.orange { color:var(--orange); }
@@ -131,29 +232,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .toolbar { display:flex; flex-wrap:wrap; gap:10px; align-items:center; justify-content:space-between; margin-bottom:14px; }
   .search {
     flex:1; min-width:210px; background:var(--surface); border:1px solid var(--border);
-    color:#fff; padding:10px 14px; border-radius:12px; font-size:14px; outline:none;
+    backdrop-filter:blur(12px); -webkit-backdrop-filter:blur(12px);
+    color:#fff; padding:10px 14px; border-radius:12px; font-size:14px; outline:none; transition:border-color .2s;
   }
   .search:focus { border-color:var(--orange); }
   .btn {
     border:none; border-radius:11px; padding:9px 14px; font-weight:600; font-size:13px;
-    cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:.15s;
+    cursor:pointer; display:inline-flex; align-items:center; gap:6px; transition:transform .12s, opacity .15s;
   }
-  .btn-orange { background:var(--orange); color:#fff; }
+  .btn:active { transform:scale(.95); }
+  .btn-orange { background:linear-gradient(135deg,#ff6b35,#ff4d0d); color:#fff; box-shadow:0 4px 16px rgba(255,90,31,.25); }
   .btn-dark { background:var(--card-2); color:var(--text); border:1px solid var(--border); }
   .btn-green { background:var(--green-soft); color:var(--green); border:1px solid rgba(34,197,94,.3); }
   .btn-red { background:var(--red-soft); color:var(--red); border:1px solid rgba(239,68,68,.3); }
   .btn-sm { padding:6px 10px; font-size:12px; border-radius:9px; }
 
   .ship-list { display:flex; flex-direction:column; gap:14px; }
-  .ship-card { background:var(--card); border:1px solid var(--border); border-radius:18px; overflow:hidden; }
+  .ship-card {
+    background:var(--card); border:1px solid var(--border); border-radius:18px; overflow:hidden;
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
+    box-shadow:0 10px 30px rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.05);
+    animation:fadeUp .35s ease backwards;
+  }
   .ship-head {
-    padding:14px 16px; background:var(--surface); border-bottom:1px solid var(--border);
+    padding:14px 16px; background:rgba(16,16,20,.6); border-bottom:1px solid var(--border);
     display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px;
   }
   .ship-title { font-size:17px; font-weight:700; display:flex; align-items:center; gap:8px; }
   .badge { font-size:11px; font-weight:700; padding:3px 8px; border-radius:999px; }
   .badge-active { background:var(--orange-soft); color:var(--orange); }
-  .badge-arch { background:#27272a; color:var(--muted); }
+  .badge-arch { background:rgba(255,255,255,.08); color:var(--muted); }
   .badge-sold { background:var(--green-soft); color:var(--green); }
   .ship-actions { display:flex; flex-wrap:wrap; gap:6px; }
   .items-grid {
@@ -162,11 +270,13 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .micro-card {
     background:var(--card-2); border:1px solid var(--border); border-radius:14px;
     padding:12px; display:flex; flex-direction:column; justify-content:space-between; gap:8px;
+    transition:transform .16s, border-color .2s;
   }
+  .micro-card:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
   .micro-top { display:flex; justify-content:space-between; align-items:flex-start; gap:8px; }
   .micro-name { font-weight:700; font-size:14px; line-height:1.3; }
   .track-pill {
-    display:inline-block; background:#0d0d10; border:1px solid var(--border);
+    display:inline-block; background:rgba(9,9,11,.75); border:1px solid var(--border);
     padding:4px 8px; border-radius:8px; font-family:ui-monospace,SFMono-Regular,monospace;
     font-size:12px; color:#e4e4e7; cursor:pointer; user-select:all;
   }
@@ -178,32 +288,42 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .posts-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(290px,1fr)); gap:12px; }
   .post-card {
     background:var(--card); border:1px solid var(--border); border-radius:16px; padding:14px;
+    backdrop-filter:blur(14px); -webkit-backdrop-filter:blur(14px);
     display:flex; flex-direction:column; justify-content:space-between; gap:12px;
+    animation:fadeUp .35s ease backwards; transition:transform .16s, border-color .2s;
   }
+  .post-card:hover { transform:translateY(-2px); border-color:rgba(255,90,31,.35); }
   .post-text { font-size:13px; line-height:1.45; white-space:pre-wrap; color:#e4e4e7; max-height:190px; overflow:auto; }
   .post-foot { display:flex; align-items:center; justify-content:space-between; gap:8px; border-top:1px solid var(--border); padding-top:10px; }
 
   .modal-bg {
-    position:fixed; inset:0; background:rgba(0,0,0,.72); z-index:50;
-    display:none; align-items:center; justify-content:center; padding:16px;
+    position:fixed; inset:0; background:rgba(0,0,0,.68);
+    backdrop-filter:blur(6px); -webkit-backdrop-filter:blur(6px);
+    z-index:50; display:none; align-items:center; justify-content:center; padding:16px;
   }
   .modal-bg.open { display:flex; }
   .modal {
-    width:100%; max-width:420px; background:var(--card); border:1px solid var(--border);
-    border-radius:18px; padding:18px;
+    width:100%; max-width:420px; background:rgba(24,24,30,.88);
+    backdrop-filter:blur(22px); -webkit-backdrop-filter:blur(22px);
+    border:1px solid rgba(255,255,255,.12); border-radius:20px; padding:20px;
+    box-shadow:0 24px 60px rgba(0,0,0,.65);
+    animation:modalIn .22s cubic-bezier(.16,1,.3,1);
   }
   .modal h3 { margin:0 0 12px; font-size:17px; }
   .field { margin-bottom:10px; }
   .field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
   .field input, .field select {
     width:100%; padding:10px 12px; border-radius:10px; border:1px solid var(--border);
-    background:#0d0d10; color:#fff; font-size:14px; outline:none;
+    background:rgba(10,10,14,.7); color:#fff; font-size:14px; outline:none;
   }
+  .field input:focus, .field select:focus { border-color:var(--orange); }
   .modal-btns { display:flex; justify-content:flex-end; gap:8px; margin-top:14px; }
   .toast {
     position:fixed; bottom:20px; left:50%; transform:translateX(-50%);
-    background:#27272a; color:#fff; padding:10px 16px; border-radius:12px;
+    background:rgba(24,24,30,.92); backdrop-filter:blur(12px);
+    color:#fff; padding:10px 16px; border-radius:12px;
     border:1px solid var(--orange); font-size:13px; z-index:60; display:none;
+    animation:fadeUp .2s ease;
   }
   .empty { text-align:center; padding:34px 16px; color:var(--muted); background:var(--card); border:1px dashed var(--border); border-radius:16px; }
 </style>
@@ -213,11 +333,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="brand">
       __LOGO__
       <div>
-        <div class="brand-title">Q<span>CRM</span></div>
+        <div class="brand-title">Q<span>CRM</span><span class="live-dot" title="Online"></span></div>
         <div class="brand-sub">QHEAD Mobile</div>
       </div>
     </div>
-    <button class="btn btn-dark btn-sm" onclick="loadAll()">🔄 Обновить</button>
+    <div style="display:flex;gap:8px"><button class="btn btn-dark btn-sm" onclick="loadAll()">🔄</button><a href="/logout" class="btn btn-dark btn-sm" style="text-decoration:none">🚪 Выйти</a></div>
   </header>
 
   <nav class="tabs">
@@ -267,7 +387,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   <div id="toast" class="toast"></div>
 
 <script>
-let STATE = { finances: {}, shipments: [], posts: [], direct_items: [] };
+let STATE = { role: 'owner', label: 'QHEAD Mobile', finances: {}, shipments: [], posts: [], direct_items: [] };
 let CURRENT_TAB = 'crm';
 
 function esc(s) {
@@ -318,14 +438,39 @@ async function loadAll() {
 }
 
 function render() {
+  const isPersonalOnly = STATE.role === 'admin_personal';
+  const tabBtns = document.querySelectorAll('.tab');
+  if (isPersonalOnly) {
+    if (tabBtns[0]) tabBtns[0].style.display = 'none';
+    if (tabBtns[2]) tabBtns[2].style.display = 'none';
+    if (tabBtns[3]) tabBtns[3].style.display = 'none';
+    if (CURRENT_TAB !== 'direct') {
+      CURRENT_TAB = 'direct';
+      tabBtns.forEach(b => b.classList.remove('active'));
+      if (tabBtns[1]) tabBtns[1].classList.add('active');
+      document.getElementById('view-crm').style.display = 'none';
+      document.getElementById('view-direct').style.display = '';
+      document.getElementById('view-posts').style.display = 'none';
+      document.getElementById('view-archive').style.display = 'none';
+    }
+  }
   const f = STATE.finances || {};
-  document.getElementById('kpiBar').innerHTML = `
-    <div class="kpi"><div class="kpi-label">Вложено (товары + доставка)</div><div class="kpi-val orange">${fmtMoney(f.total_spent)}</div></div>
-    <div class="kpi"><div class="kpi-label">В пути (мои товары)</div><div class="kpi-val">${fmtMoney(f.invested_active)}</div></div>
-    <div class="kpi"><div class="kpi-label">Доставка (архив)</div><div class="kpi-val">${fmtMoney(f.delivery_total)}</div></div>
-    <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue_total)}</div></div>
-    <div class="kpi"><div class="kpi-label">Прибыль по проданным</div><div class="kpi-val green">${fmtMoney(f.sold_profit_items)}</div></div>
-  `;
+  if (isPersonalOnly) {
+    document.getElementById('kpiBar').innerHTML = `
+      <div class="kpi"><div class="kpi-label">В наличии</div><div class="kpi-val">${f.in_stock_count || 0} шт.</div></div>
+      <div class="kpi"><div class="kpi-label">Всего вложено</div><div class="kpi-val orange">${fmtMoney(f.invested)}</div></div>
+      <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue)}</div></div>
+      <div class="kpi"><div class="kpi-label">Прибыль по проданным</div><div class="kpi-val green">${fmtMoney(f.profit)}</div></div>
+    `;
+  } else {
+    document.getElementById('kpiBar').innerHTML = `
+      <div class="kpi"><div class="kpi-label">Вложено (товары + доставка)</div><div class="kpi-val orange">${fmtMoney(f.total_spent)}</div></div>
+      <div class="kpi"><div class="kpi-label">В пути (мои товары)</div><div class="kpi-val">${fmtMoney(f.invested_active)}</div></div>
+      <div class="kpi"><div class="kpi-label">Доставка (архив)</div><div class="kpi-val">${fmtMoney(f.delivery_total)}</div></div>
+      <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue_total)}</div></div>
+      <div class="kpi"><div class="kpi-label">Прибыль по проданным</div><div class="kpi-val green">${fmtMoney(f.sold_profit_items)}</div></div>
+    `;
+  }
 
   if (CURRENT_TAB === 'crm') renderShipments('active', 'crmList', 'crmSearch');
   if (CURRENT_TAB === 'archive') renderShipments('archived', 'archList', 'archSearch');
@@ -718,18 +863,25 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
     @web.middleware
     async def auth_mw(request: web.Request, handler):
-        if request.path in ("/login", "/health"):
+        if request.path in ("/login", "/logout", "/health"):
             return await handler(request)
-        if not _is_authorized(request):
+        sess = _get_session(request)
+        if not sess:
             if request.path.startswith("/api/"):
                 return web.json_response({"error": "Unauthorized"}, status=401)
             raise web.HTTPFound("/login")
+        request["session"] = sess
         return await handler(request)
 
     app.middlewares.append(auth_mw)
 
     async def handle_health(_: web.Request) -> web.Response:
         return web.Response(text="OK")
+
+    async def handle_logout(_: web.Request) -> web.Response:
+        resp = web.HTTPFound("/login")
+        resp.del_cookie(COOKIE_NAME)
+        raise resp
 
     async def handle_login_get(_: web.Request) -> web.Response:
         html = LOGIN_HTML.replace("__LOGO__", _get_logo_html()).replace("__ERR__", "")
@@ -740,7 +892,12 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         pwd = str(data.get("password", "")).strip()
         if not WEB_PASSWORD or pwd == WEB_PASSWORD:
             resp = web.HTTPFound("/")
-            resp.set_cookie(COOKIE_NAME, _auth_token(), httponly=True, max_age=86400 * 30)
+            resp.set_cookie(COOKIE_NAME, _owner_token(), httponly=True, max_age=86400 * 30)
+            raise resp
+        adm = deps["find_admin_by_web_password"](pwd)
+        if adm:
+            resp = web.HTTPFound("/")
+            resp.set_cookie(COOKIE_NAME, _admin_token(adm["user_hash"]), httponly=True, max_age=86400 * 30)
             raise resp
         html = LOGIN_HTML.replace("__LOGO__", _get_logo_html()).replace(
             "__ERR__", '<div class="err">Неверный пароль</div>'
@@ -751,7 +908,25 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         html = DASHBOARD_HTML.replace("__LOGO__", _get_logo_html())
         return web.Response(text=html, content_type="text/html")
 
-    async def handle_dashboard(_: web.Request) -> web.Response:
+    async def handle_dashboard(request: web.Request) -> web.Response:
+        sess = request["session"]
+        if sess["role"] == "admin_personal":
+            uhash = sess["user_hash"]
+            finances = deps["get_personal_stats_by_hash"](uhash)
+            direct_items = []
+            for de in deps["get_personal_entries_by_hash"](uhash):
+                d = dict(de)
+                pref = d.get("photo_ref") or ""
+                d["photo_url"] = f"/api/photo/{pref}" if pref.startswith("web_") else ""
+                direct_items.append(d)
+            return web.json_response({
+                "role": "admin_personal",
+                "finances": finances,
+                "shipments": [],
+                "posts": [],
+                "direct_items": direct_items,
+            })
+
         finances = deps["get_crm_finances"]()
         all_ships = []
         for status in ("active", "archived"):
@@ -770,6 +945,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 d["photo_url"] = f"/api/photo/{pref}" if pref.startswith("web_") else ""
                 direct_items.append(d)
         return web.json_response({
+            "role": "owner",
             "finances": finances,
             "shipments": all_ships,
             "posts": posts,
@@ -879,8 +1055,14 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.json_response({"ok": True})
 
 
+    def _target_hash(request: web.Request) -> Optional[str]:
+        sess = request["session"]
+        if sess["role"] == "admin_personal":
+            return sess["user_hash"]
+        return deps["get_owner_hash"]()
+
     async def handle_create_direct(request: web.Request) -> web.Response:
-        owner_hash = deps["get_owner_hash"]()
+        owner_hash = _target_hash(request)
         if not owner_hash:
             return web.json_response({"error": "Сначала нажмите /start в боте"}, status=400)
         body = await request.json()
@@ -905,7 +1087,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.json_response({"id": did})
 
     async def handle_sell_direct(request: web.Request) -> web.Response:
-        owner_hash = deps["get_owner_hash"]()
+        owner_hash = _target_hash(request)
         if not owner_hash:
             return web.json_response({"error": "Owner not set"}, status=400)
         did = int(request.match_info["id"])
@@ -915,7 +1097,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.json_response({"ok": True})
 
     async def handle_delete_direct(request: web.Request) -> web.Response:
-        owner_hash = deps["get_owner_hash"]()
+        owner_hash = _target_hash(request)
         if not owner_hash:
             return web.json_response({"error": "Owner not set"}, status=400)
         did = int(request.match_info["id"])
@@ -932,6 +1114,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.FileResponse(fpath)
 
     app.router.add_get("/health", handle_health)
+    app.router.add_get("/logout", handle_logout)
     app.router.add_get("/login", handle_login_get)
     app.router.add_post("/login", handle_login_post)
     app.router.add_get("/", handle_index)

@@ -178,6 +178,7 @@ def init_db() -> None:
                 can_crm INTEGER NOT NULL DEFAULT 1,
                 can_post INTEGER NOT NULL DEFAULT 1,
                 can_personal_ledger INTEGER NOT NULL DEFAULT 0,
+                web_password_hash TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
             """
@@ -250,6 +251,8 @@ def init_db() -> None:
             conn.execute("ALTER TABLE admins ADD COLUMN can_post INTEGER NOT NULL DEFAULT 1")
         if "can_personal_ledger" not in admin_cols:
             conn.execute("ALTER TABLE admins ADD COLUMN can_personal_ledger INTEGER NOT NULL DEFAULT 0")
+        if "web_password_hash" not in admin_cols:
+            conn.execute("ALTER TABLE admins ADD COLUMN web_password_hash TEXT DEFAULT ''")
 
         ship_cols = {r[1] for r in conn.execute("PRAGMA table_info(shipments)").fetchall()}
         if "delivery_cost" not in ship_cols:
@@ -728,6 +731,45 @@ def delete_personal_entry_by_hash(entry_id: int, uid_hash: str) -> None:
         conn.commit()
 
 
+def set_admin_web_password(user_id: int, raw_password: str) -> None:
+    uid_hash = hash_user_id(user_id)
+    pwd_hash = hashlib.sha256(raw_password.encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute(
+            "UPDATE admins SET web_password_hash = ? WHERE user_hash = ?",
+            (pwd_hash, uid_hash),
+        )
+        conn.commit()
+
+
+def find_admin_by_web_password(raw_password: str) -> Optional[sqlite3.Row]:
+    if not raw_password:
+        return None
+    pwd_hash = hashlib.sha256(raw_password.encode("utf-8")).hexdigest()
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM admins WHERE web_password_hash = ? AND can_personal_ledger = 1",
+            (pwd_hash,),
+        ).fetchone()
+
+
+def get_personal_stats_by_hash(uid_hash: str) -> dict:
+    entries = get_personal_entries_by_hash(uid_hash)
+    invested = sum(e["buy_price"] for e in entries)
+    sold_entries = [e for e in entries if e["status"] == "sold" and e["sell_price"] is not None]
+    revenue = sum(e["sell_price"] for e in sold_entries)
+    sold_buy = sum(e["buy_price"] for e in sold_entries)
+    return {
+        "total_count": len(entries),
+        "in_stock_count": len(entries) - len(sold_entries),
+        "sold_count": len(sold_entries),
+        "invested": invested,
+        "revenue": revenue,
+        "profit": revenue - sold_buy,
+    }
+
+
 def get_personal_stats(user_id: int) -> dict:
     entries = get_personal_entries(user_id)
     invested = sum(e["buy_price"] for e in entries)
@@ -795,6 +837,7 @@ class PersonalFSM(StatesGroup):
     waiting_entry_buy_price = State()
     waiting_entry_photo = State()
     waiting_entry_sell_price = State()
+    waiting_web_password = State()
 
 
 # ---------------------------------------------------------------------------
@@ -848,15 +891,19 @@ def posts_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def personal_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Записать заход", callback_data="pers_add")],
-            [InlineKeyboardButton(text="💰 Отметить продажу", callback_data="pers_sell_list")],
-            [InlineKeyboardButton(text="📊 Моя статистика и список", callback_data="pers_stats")],
-            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
-        ]
-    )
+def personal_menu_kb(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="➕ Записать заход", callback_data="pers_add")],
+        [InlineKeyboardButton(text="💰 Отметить продажу", callback_data="pers_sell_list")],
+        [InlineKeyboardButton(text="📊 Моя статистика и список", callback_data="pers_stats")],
+        [InlineKeyboardButton(text="🔑 Указать пароль для Веб-CRM", callback_data="pers_set_webpwd")],
+    ]
+    if WEB_URL and user_id is not None:
+        rec = get_admin_record(user_id)
+        if rec and rec["web_password_hash"]:
+            rows.append([InlineKeyboardButton(text="🌐 Открыть Веб-учёт", web_app=WebAppInfo(url=WEB_URL))])
+    rows.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def buy_button_kb() -> InlineKeyboardMarkup:
@@ -1108,7 +1155,7 @@ async def cb_personal_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(
         "💼 <b>Ваш личный учёт техники</b>\nЭти записи видите только вы.",
-        reply_markup=personal_menu_kb(),
+        reply_markup=personal_menu_kb(callback.from_user.id),
     )
     await callback.answer()
 
@@ -1169,6 +1216,38 @@ async def cb_owner_direct_list(callback: CallbackQuery) -> None:
         ),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "pers_set_webpwd")
+async def cb_pers_set_webpwd(callback: CallbackQuery, state: FSMContext) -> None:
+    if not has_perm(callback.from_user.id, "can_personal_ledger"):
+        return
+    await state.set_state(PersonalFSM.waiting_web_password)
+    await callback.message.edit_text(
+        "🔑 Введите <b>ваш личный пароль для входа в Веб-CRM</b> (минимум 4 символа):",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="personal_menu")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(PersonalFSM.waiting_web_password, F.text)
+async def msg_pers_webpwd(message: Message, state: FSMContext) -> None:
+    pwd = message.text.strip()
+    if len(pwd) < 4:
+        await message.answer("⚠️ Пароль должен быть минимум 4 символа. Попробуйте ещё раз:")
+        return
+    main_pwd = os.getenv("WEB_PASSWORD", "").strip()
+    if main_pwd and pwd == main_pwd:
+        await message.answer("⚠️ Этот пароль уже занят, придумайте другой:")
+        return
+    set_admin_web_password(message.from_user.id, pwd)
+    await state.clear()
+    await message.answer(
+        "✅ Личный пароль для Веб-CRM сохранён! Теперь вы можете войти по нему в веб-интерфейс (там будет только ваш личный раздел «Свои товары»).",
+        reply_markup=personal_menu_kb(message.from_user.id),
+    )
 
 
 @router.callback_query(F.data == "pers_add")
@@ -2403,6 +2482,8 @@ async def main() -> None:
     web_deps = {
         "get_crm_finances": get_crm_finances,
         "get_owner_hash": get_owner_hash,
+        "find_admin_by_web_password": find_admin_by_web_password,
+        "get_personal_stats_by_hash": get_personal_stats_by_hash,
         "get_personal_entries_by_hash": get_personal_entries_by_hash,
         "add_personal_entry_by_hash": add_personal_entry_by_hash,
         "mark_personal_sold_by_hash": mark_personal_sold_by_hash,
