@@ -338,6 +338,12 @@ def get_admin_record(user_id: int) -> Optional[sqlite3.Row]:
         return conn.execute("SELECT * FROM admins WHERE user_hash = ?", (uid_hash,)).fetchone()
 
 
+def get_admin_by_hash(uid_hash: str) -> Optional[sqlite3.Row]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute("SELECT * FROM admins WHERE user_hash = ?", (uid_hash,)).fetchone()
+
+
 def get_admin_by_id(admin_row_id: int) -> Optional[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
@@ -749,7 +755,7 @@ def find_admin_by_web_password(raw_password: str) -> Optional[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute(
-            "SELECT * FROM admins WHERE web_password_hash = ? AND can_personal_ledger = 1",
+            "SELECT * FROM admins WHERE web_password_hash = ?",
             (pwd_hash,),
         ).fetchone()
 
@@ -852,9 +858,9 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📝 Создать/Редактировать пост", callback_data="posts_menu")])
     if has_perm(user_id, "can_personal_ledger"):
         rows.append([InlineKeyboardButton(text="💼 Мой учёт", callback_data="personal_menu")])
+    if WEB_URL:
+        rows.append([InlineKeyboardButton(text="🌐 Веб-QCRM", web_app=WebAppInfo(url=WEB_URL))])
     if is_owner(user_id):
-        if WEB_URL:
-            rows.append([InlineKeyboardButton(text="🌐 Веб-QCRM", web_app=WebAppInfo(url=WEB_URL))])
         rows.append([InlineKeyboardButton(text="👥 Доступ (Админы)", callback_data="admins_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2483,6 +2489,7 @@ async def main() -> None:
         "get_crm_finances": get_crm_finances,
         "get_owner_hash": get_owner_hash,
         "find_admin_by_web_password": find_admin_by_web_password,
+        "get_admin_by_hash": get_admin_by_hash,
         "get_personal_stats_by_hash": get_personal_stats_by_hash,
         "get_personal_entries_by_hash": get_personal_entries_by_hash,
         "add_personal_entry_by_hash": add_personal_entry_by_hash,

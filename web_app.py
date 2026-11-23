@@ -145,6 +145,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div class="bg-fall" id="bgFall"></div>
+  <canvas id="boomCanvas" style="position:fixed;inset:0;pointer-events:none;z-index:99;display:none"></canvas>
   <form class="box" method="post" action="/login">
     __LOGO__
     <h1>Q<span>CRM</span></h1>
@@ -152,6 +153,10 @@ LOGIN_HTML = """<!DOCTYPE html>
     __ERR__
     <input type="password" name="password" placeholder="Пароль доступа" required autofocus>
     <button type="submit">Войти</button>
+    <div style="margin-top:16px;padding:10px 12px;border-radius:12px;background:rgba(255,90,31,.1);border:1px solid rgba(255,90,31,.28);font-size:12px;color:#e4e4e7;line-height:1.4;text-align:left">
+      💡 <b>Нет пароля?</b><br>
+      Откройте бота в Telegram → перейдите во вкладку <b>«💼 Мой учёт»</b> на главном экране → нажмите <b>«🔑 Указать пароль для Веб-CRM»</b>.
+    </div>
   </form>
 <script>__FALL_JS__</script>
 </body>
@@ -504,26 +509,62 @@ async function loadAll() {
 }
 
 function render() {
-  const isPersonalOnly = STATE.role === 'admin_personal';
-  if (isPersonalOnly) {
-    document.querySelectorAll('.dock-btn').forEach(b => {
-      if (b.dataset.tab !== 'home' && b.dataset.tab !== 'direct') b.style.display = 'none';
-    });
-    if (CURRENT_TAB !== 'home' && CURRENT_TAB !== 'direct') switchTab('home');
-  }
+  const isOwner = STATE.role === 'owner';
+  const perms = STATE.perms || { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner };
+  document.querySelectorAll('.dock-btn').forEach(b => {
+    const t = b.dataset.tab;
+    let show = true;
+    if (t === 'crm' || t === 'archive') show = !!perms.can_crm;
+    if (t === 'posts') show = !!perms.can_post;
+    if (t === 'direct') show = !!perms.can_personal_ledger;
+    b.style.display = show ? '' : 'none';
+  });
 
-  if (CURRENT_TAB === 'home') renderHome(isPersonalOnly);
+  if (CURRENT_TAB === 'home') renderHome(!isOwner, perms);
   if (CURRENT_TAB === 'crm') renderShipments('active', 'crmList', 'crmSearch');
   if (CURRENT_TAB === 'archive') renderShipments('archived', 'archList', 'archSearch');
   if (CURRENT_TAB === 'direct') renderDirect();
   if (CURRENT_TAB === 'posts') renderPosts();
 }
 
-function renderHome(isPersonalOnly) {
+function renderHome(isAdmin, perms) {
   const f = STATE.finances || {};
   const el = document.getElementById('view-home');
 
-  if (isPersonalOnly) {
+  if (isAdmin) {
+    const crmCard = perms.can_crm ? `<button class="quick-btn" onclick="switchTab('crm')"><span class="ico">📦</span>CRM Треки</button>` : '';
+    const postCard = perms.can_post ? `<button class="quick-btn" onclick="switchTab('posts')"><span class="ico">📝</span>Посты</button>` : '';
+    const dirCard = perms.can_personal_ledger ? `<button class="quick-btn" onclick="openNewDirect()"><span class="ico">➕</span>Свой товар</button>` : '';
+    const finHero = perms.can_personal_ledger ? `
+      <div class="hero-card">
+        <div class="hero-row">
+          <div>
+            <div class="hero-lbl">💼 Ваш личный бюджет (вложено)</div>
+            <div class="hero-val">${fmtMoney(f.invested)}</div>
+          </div>
+          <div style="text-align:right">
+            <div class="hero-lbl">📈 Прибыль</div>
+            <div class="hero-sub">${fmtMoney(f.profit)}</div>
+          </div>
+        </div>
+      </div>
+      <div class="kpi-grid">
+        <div class="kpi"><div class="kpi-label">📦 В наличии</div><div class="kpi-val">${f.in_stock_count || 0} шт.</div></div>
+        <div class="kpi"><div class="kpi-label">💵 Выручка</div><div class="kpi-val green">${fmtMoney(f.revenue)}</div></div>
+      </div>` : '';
+    el.innerHTML = `
+      ${finHero}
+      <div class="sec-title">Доступные разделы</div>
+      <div class="quick-grid">
+        ${crmCard}
+        ${postCard}
+        ${dirCard}
+      </div>
+    `;
+    return;
+  }
+
+  if (false) {
     el.innerHTML = `
       <div class="hero-card">
         <div class="hero-row">
@@ -616,7 +657,7 @@ function renderShipments(status, listId, searchId) {
       let ownerHtml = '';
       if (it.owner_type === 'my') {
         const soldTag = it.sold_price ? ` <span class="badge badge-sold">Продано: ${esc(it.sold_price)}</span>` : '';
-        ownerHtml = `<span class="owner-my">Мой • ${esc(it.price || '0 ₽')}</span>${soldTag}`;
+        ownerHtml = `<span class="owner-my">Мой${it.price ? ' • ' + esc(it.price) : ' (склад)'}</span>${soldTag}`;
       } else if (it.owner_type === 'client') {
         ownerHtml = `<span class="owner-client">Клиент • ${esc(it.client_contact || '—')}</span>`;
       } else {
@@ -820,7 +861,67 @@ async function submitNewPost() {
     const photos = [];
     for (const f of files) photos.push(await compressImage(f, 1280, 0.82));
     await api('/api/posts', 'POST', { photos, text, linked_item_id });
-    closeModal(); toast('Пост опубликован в канал!'); loadAll();
+    closeModal(); toast('Пост опубликован в канал!'); 
+(function(){
+  if (!new URLSearchParams(location.search).has('welcome')) return;
+  history.replaceState(null, '', '/');
+  const cv = document.getElementById('boomCanvas');
+  if (!cv) return;
+  cv.style.display = 'block';
+  const ctx = cv.getContext('2d');
+  const W = cv.width = window.innerWidth;
+  const H = cv.height = window.innerHeight;
+  const cx = W / 2, cy = H / 2;
+  const colors = ['#ff5a1f', '#ff8c42', '#ffd166', '#ffffff', '#ff3b30'];
+  const parts = [];
+  for (let i = 0; i < 95; i++) {
+    const ang = Math.random() * Math.PI * 2;
+    const spd = 3 + Math.random() * 11;
+    parts.push({
+      x: cx, y: cy,
+      vx: Math.cos(ang) * spd,
+      vy: Math.sin(ang) * spd - 1.5,
+      r: 2.5 + Math.random() * 4.5,
+      c: colors[i % colors.length],
+      life: 1,
+      decay: 0.015 + Math.random() * 0.018
+    });
+  }
+  let ringR = 10, ringA = 0.9;
+  function frame() {
+    ctx.clearRect(0, 0, W, H);
+    if (ringA > 0.02) {
+      ctx.beginPath();
+      ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+      ctx.strokeStyle = 'rgba(255,90,31,' + ringA + ')';
+      ctx.lineWidth = 4;
+      ctx.stroke();
+      ringR += 16;
+      ringA *= 0.9;
+    }
+    let alive = false;
+    for (const p of parts) {
+      if (p.life <= 0) continue;
+      alive = true;
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.22;
+      p.vx *= 0.985;
+      p.life -= p.decay;
+      ctx.globalAlpha = Math.max(0, p.life);
+      ctx.fillStyle = p.c;
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.globalAlpha = 1;
+    if (alive || ringA > 0.02) requestAnimationFrame(frame);
+    else cv.style.display = 'none';
+  }
+  requestAnimationFrame(frame);
+})();
+
+loadAll();
   } catch (e) {
     toast(e.message); btn.disabled = false; btn.textContent = '✅ Добавить КУПИТЬ✅ и выложить';
   }
@@ -1075,12 +1176,12 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         data = await request.post()
         pwd = str(data.get("password", "")).strip()
         if not WEB_PASSWORD or pwd == WEB_PASSWORD:
-            resp = web.HTTPFound("/")
+            resp = web.HTTPFound("/?welcome=1")
             resp.set_cookie(COOKIE_NAME, _owner_token(), httponly=True, max_age=86400 * 30)
             raise resp
         adm = deps["find_admin_by_web_password"](pwd)
         if adm:
-            resp = web.HTTPFound("/")
+            resp = web.HTTPFound("/?welcome=1")
             resp.set_cookie(COOKIE_NAME, _admin_token(adm["user_hash"]), httponly=True, max_age=86400 * 30)
             raise resp
         html = (
@@ -1098,18 +1199,46 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         sess = request["session"]
         if sess["role"] == "admin_personal":
             uhash = sess["user_hash"]
-            finances = deps["get_personal_stats_by_hash"](uhash)
+            adm = deps["get_admin_by_hash"](uhash)
+            perms = {
+                "can_crm": bool(adm["can_crm"]) if adm else False,
+                "can_post": bool(adm["can_post"]) if adm else False,
+                "can_personal_ledger": bool(adm["can_personal_ledger"]) if adm else False,
+            }
+            finances = deps["get_personal_stats_by_hash"](uhash) if perms["can_personal_ledger"] else {}
+
+            all_ships = []
+            if perms["can_crm"]:
+                for status in ("active", "archived"):
+                    for s in deps["get_shipments"](status):
+                        sd = dict(s)
+                        sd["delivery_cost"] = 0
+                        s_items = []
+                        for i in deps["get_items"](s["id"]):
+                            it = dict(i)
+                            # Скрываем ваши деньги (цены закупки и продажи) от админов
+                            if it.get("owner_type") == "my":
+                                it["price"] = ""
+                                it["sold_price"] = ""
+                            s_items.append(it)
+                        sd["items"] = s_items
+                        all_ships.append(sd)
+
+            posts = [dict(p) for p in deps["get_all_posts"]()] if perms["can_post"] else []
             direct_items = []
-            for de in deps["get_personal_entries_by_hash"](uhash):
-                d = dict(de)
-                pref = d.get("photo_ref") or ""
-                d["photo_url"] = f"/api/photo/{pref}" if pref.startswith("web_") else ""
-                direct_items.append(d)
+            if perms["can_personal_ledger"]:
+                for de in deps["get_personal_entries_by_hash"](uhash):
+                    d = dict(de)
+                    pref = d.get("photo_ref") or ""
+                    d["photo_url"] = f"/api/photo/{pref}" if pref.startswith("web_") else ""
+                    direct_items.append(d)
+
             return web.json_response({
-                "role": "admin_personal",
+                "role": "admin",
+                "perms": perms,
                 "finances": finances,
-                "shipments": [],
-                "posts": [],
+                "shipments": all_ships,
+                "posts": posts,
                 "direct_items": direct_items,
                 "unsold_my": [],
             })
@@ -1138,6 +1267,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
                 direct_items.append(d)
         return web.json_response({
             "role": "owner",
+            "perms": {"can_crm": True, "can_post": True, "can_personal_ledger": True},
             "finances": finances,
             "shipments": all_ships,
             "posts": posts,
@@ -1146,8 +1276,10 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         })
 
     async def handle_create_post(request: web.Request) -> web.Response:
-        if request["session"]["role"] != "owner":
-            return web.json_response({"error": "Forbidden"}, status=403)
+        if request["session"]["role"] == "admin_personal":
+            adm = deps["get_admin_by_hash"](request["session"]["user_hash"])
+            if not adm or not adm["can_post"]:
+                return web.json_response({"error": "Forbidden"}, status=403)
         channel_id = deps["get_setting"]("channel_id")
         if not channel_id:
             return web.json_response({"error": "Сначала подключите канал в боте (⚙️ Канал для постов)"}, status=400)
