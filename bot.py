@@ -25,6 +25,7 @@ from aiogram.types import (
     Message,
     MessageEntity,
     TelegramObject,
+    WebAppInfo,
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -36,6 +37,8 @@ DB_PATH = os.getenv("DB_PATH", DEFAULT_DB)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ENV_ADMIN_ID = os.getenv("ADMIN_ID", "").strip()
 ENV_CHANNEL_ID = os.getenv("CHANNEL_ID", "").strip()
+_RAW_WEB_URL = os.getenv("WEB_URL", "").strip()
+WEB_URL = (_RAW_WEB_URL if _RAW_WEB_URL.startswith("http") else f"https://{_RAW_WEB_URL}") if _RAW_WEB_URL else ""
 
 BUY_URL = "https://t.me/QQHead"
 
@@ -807,6 +810,8 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     if has_perm(user_id, "can_personal_ledger"):
         rows.append([InlineKeyboardButton(text="💼 Мой учёт", callback_data="personal_menu")])
     if is_owner(user_id):
+        if WEB_URL:
+            rows.append([InlineKeyboardButton(text="🌐 Веб-QCRM", web_app=WebAppInfo(url=WEB_URL))])
         rows.append([InlineKeyboardButton(text="👥 Доступ (Админы)", callback_data="admins_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
