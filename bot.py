@@ -1801,68 +1801,69 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
     wait_msg = await message.answer("⏳ Ищу запчасти на Moba...")
     await state.clear()
 
-    try:
-        res = await asyncio.wait_for(search_parts_all(query), timeout=10.0)
-    except Exception as e:
-        logger.warning(f"Bot parts search failed/timeout for {query}: {e}")
-        from urllib.parse import quote_plus
-        q_enc = quote_plus(query)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Открыть Moba", url=f"https://moba.ru/catalog/?q={q_enc}"),
-                ],
-                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
-            ]
-        )
-        await wait_msg.edit_text(
-            f"⚠️ Сайты поставщиков отвечают слишком долго. Откройте поиск по запросу <b>{h(query)}</b> напрямую:",
-            reply_markup=kb,
-        )
-        return
-
-    prices = [dict(r) for r in get_repair_prices()]
-    work_title, work_price = match_work_price(query, prices)
-
-    lines = [
-        f"🔍 Результаты по запросу: <b>{h(query)}</b> (<i>{h(res['normalized_query'])}</i>)",
-        f"🛠 Работа ({h(work_title)}): <b>{fmt_money(work_price)}</b>\n",
-    ]
-    for site_name, items in res["groups"].items():
-        lines.append(f"🏬 <b>{site_name}</b>")
-        if not items:
-            st = res.get("statuses", {}).get(site_name, 0)
-            note = f" (HTTP {st})" if st and st != 200 else ""
-            lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
-        else:
-            for it in items[:3]:
-                total = it["price"] + work_price
-                stock = "✅" if it["in_stock"] else "⏳"
-                lines.append(
-                    f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'][:85])}</a>\n"
-                    f"   Качество: <b>{h(it['quality'])}</b>\n"
-                    f"   <sub>Запчасть: {fmt_money(it['price'])}</sub> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
-                )
-        lines.append("")
-
-    urls = res["search_urls"]
-    kb = InlineKeyboardMarkup(
+    from urllib.parse import quote_plus
+    q_enc = quote_plus(query)
+    fallback_kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Открыть Moba", url=urls["moba"]),
-            ],
+            [InlineKeyboardButton(text="Открыть Moba", url=f"https://moba.ru/catalog/?q={q_enc}")],
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
         ]
     )
-    txt = "\n".join(lines)
-    if len(txt) > 3900:
-        txt = txt[:3900] + "\n..."
+
     try:
-        await wait_msg.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
-    except Exception:
-        await message.answer(txt, reply_markup=kb, disable_web_page_preview=True)
+        res = await asyncio.wait_for(search_parts_all(query), timeout=8.0)
+        prices = [dict(r) for r in get_repair_prices()]
+        work_title, work_price = match_work_price(query, prices)
+
+        lines = [
+            f"🔍 Результаты по запросу: <b>{h(query)}</b> (<i>{h(res['normalized_query'])}</i>)",
+            f"🛠 Работа ({h(work_title)}): <b>{fmt_money(work_price)}</b>\n",
+        ]
+        for site_name, items in res["groups"].items():
+            lines.append(f"🏬 <b>{site_name}</b>")
+            if not items:
+                st = res.get("statuses", {}).get(site_name, 0)
+                note = f" (HTTP {st})" if st and st != 200 else ""
+                lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
+            else:
+                for it in items[:4]:
+                    total = it["price"] + work_price
+                    stock = "✅" if it["in_stock"] else "⏳"
+                    lines.append(
+                        f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'][:85])}</a>\n"
+                        f"   Качество: <b>{h(it['quality'])}</b>\n"
+                        f"   <sub>Запчасть: {fmt_money(it['price'])}</sub> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
+                    )
+            lines.append("")
+
+        urls = res["search_urls"]
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть Moba", url=urls["moba"])],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
+            ]
+        )
+        txt = "\n".join(lines)
+        if len(txt) > 3900:
+            txt = txt[:3900] + "\n..."
+        try:
+            await wait_msg.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
+        except Exception:
+            await message.answer(txt, reply_markup=kb, disable_web_page_preview=True)
+    except Exception as e:
+        logger.exception(f"Bot parts search error for {query}: {e}")
+        try:
+            await wait_msg.edit_text(
+                f"⚠️ Не удалось загрузить карточки с Moba. Откройте поиск по запросу <b>{h(query)}</b> напрямую:",
+                reply_markup=fallback_kb,
+            )
+        except Exception:
+            await message.answer(
+                f"⚠️ Не удалось загрузить карточки с Moba. Откройте поиск напрямую:",
+                reply_markup=fallback_kb,
+            )
 
 
 @router.callback_query(F.data == "rep_prices")

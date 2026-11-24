@@ -90,7 +90,7 @@ def extract_price_num(text: str) -> float:
 
 async def _fetch_html(session: aiohttp.ClientSession, url: str) -> tuple[int, str]:
     try:
-        timeout = aiohttp.ClientTimeout(total=6, connect=3)
+        timeout = aiohttp.ClientTimeout(total=5.5, connect=2.5, sock_read=3.5)
         async with session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True) as resp:
             txt = await resp.text(errors="ignore")
             logger.info(f"Parts fetch {url} -> HTTP {resp.status}, len={len(txt)}")
@@ -258,7 +258,8 @@ async def search_parts_all(raw_query: str) -> dict[str, Any]:
         "moba": f"https://moba.ru/catalog/?q={q_enc}",
     }
 
-    async with aiohttp.ClientSession() as session:
+    connector = aiohttp.TCPConnector(force_close=True, limit=4)
+    async with aiohttp.ClientSession(connector=connector) as session:
         fetches = await asyncio.gather(
             _fetch_html(session, urls["moba"]),
             _fetch_html(session, f"https://moba.ru/search/?q={q_enc}"),
