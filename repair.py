@@ -255,20 +255,13 @@ async def search_parts_all(raw_query: str) -> dict[str, Any]:
     norm_query = normalize_query(raw_query)
     q_enc = quote_plus(norm_query)
     urls = {
-        "master_mobile": f"https://master-mobile.ru/catalog/?q={q_enc}&s=%D0%9F%D0%BE%D0%B8%D1%81%D0%BA",
         "moba": f"https://moba.ru/catalog/?q={q_enc}",
-        "mems": f"https://memstech.ru/search?q={q_enc}",
     }
 
     async with aiohttp.ClientSession() as session:
-        # Запускаем все основные и запасные URL параллельно, чтобы поиск не зависал
         fetches = await asyncio.gather(
-            _fetch_html(session, urls["master_mobile"]),
-            _fetch_html(session, f"https://master-mobile.ru/search/?q={q_enc}"),
             _fetch_html(session, urls["moba"]),
             _fetch_html(session, f"https://moba.ru/search/?q={q_enc}"),
-            _fetch_html(session, urls["mems"]),
-            _fetch_html(session, f"https://memstech.ru/catalog?q={q_enc}"),
             return_exceptions=True,
         )
 
@@ -278,33 +271,16 @@ async def search_parts_all(raw_query: str) -> dict[str, Any]:
             return val
         return (0, "")
 
-    mm_st1, mm_h1 = _safe_res(0)
-    mm_st2, mm_h2 = _safe_res(1)
-    moba_st1, moba_h1 = _safe_res(2)
-    moba_st2, moba_h2 = _safe_res(3)
-    mems_st1, mems_h1 = _safe_res(4)
-    mems_st2, mems_h2 = _safe_res(5)
-
-    mm_items = _parse_cards(mm_h1, "https://master-mobile.ru", "Master Mobile") or _parse_cards(mm_h2, "https://master-mobile.ru", "Master Mobile")
+    moba_st1, moba_h1 = _safe_res(0)
+    moba_st2, moba_h2 = _safe_res(1)
     moba_items = _parse_cards(moba_h1, "https://moba.ru", "Moba") or _parse_cards(moba_h2, "https://moba.ru", "Moba")
-    mems_items = _parse_cards(mems_h1, "https://memstech.ru", "MEMS") or _parse_cards(mems_h2, "https://memstech.ru", "MEMS")
-
-    statuses = {
-        "Master Mobile": mm_st1 or mm_st2,
-        "Moba": moba_st1 or moba_st2,
-        "MEMS": mems_st1 or mems_st2,
-    }
 
     return {
         "query": raw_query.strip(),
         "normalized_query": norm_query,
         "search_urls": urls,
-        "statuses": statuses,
-        "groups": {
-            "Master Mobile": mm_items,
-            "Moba": moba_items,
-            "MEMS": mems_items,
-        },
+        "statuses": {"Moba": moba_st1 or moba_st2},
+        "groups": {"Moba": moba_items},
     }
 
 

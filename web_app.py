@@ -200,6 +200,7 @@ LOGIN_HTML = """<!DOCTYPE html>
 DASHBOARD_HTML = """<!DOCTYPE html>
 <html lang="ru">
 <head>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, viewport-fit=cover">
 <title>QCRM — QHEAD Mobile</title>
@@ -615,8 +616,12 @@ async function api(url, method='GET', body=null) {
   const opts = { method, headers: {'Content-Type': 'application/json'} };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.error || 'Ошибка запроса');
+  const raw = await res.text();
+  let data = {};
+  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {
+    throw new Error(res.ok ? 'Ошибка ответа сервера' : ('HTTP ' + res.status));
+  }
+  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
   return data;
 }
 
@@ -631,7 +636,8 @@ async function loadAll() {
 
 function render() {
   const isOwner = STATE.role === 'owner';
-  const perms = STATE.perms || { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
+  const hasPerms = STATE.perms && Object.keys(STATE.perms).length > 0;
+  const perms = hasPerms ? STATE.perms : { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
   document.querySelectorAll('.dock-btn').forEach(b => {
     const t = b.dataset.tab;
     let show = true;
@@ -873,7 +879,7 @@ function renderParts() {
   const { work_title, work_price, groups, search_urls } = LAST_REPAIR_SEARCH;
   let html = `<div class="badge badge-active" style="margin-bottom:10px;display:inline-block">Работа (${esc(work_title)}): ${fmtMoney(work_price)}</div>`;
   for (const [site, items] of Object.entries(groups || {})) {
-    const searchUrl = site === 'Master Mobile' ? search_urls.master_mobile : (site === 'Moba' ? search_urls.moba : search_urls.mems);
+    const searchUrl = search_urls.moba || '#';
     html += `<div class="ship-card" style="margin-bottom:10px"><div class="ship-head"><div class="ship-title">${esc(site)}</div><a href="${esc(searchUrl)}" target="_blank" class="btn btn-dark btn-sm">Открыть поиск ↗</a></div><div class="items-grid">`;
     if (!items.length) {
       html += `<div style="padding:10px;color:var(--muted);font-size:12px">Карточки не найдены — откройте поиск напрямую.</div>`;
@@ -915,7 +921,7 @@ function renderRepairCRM() {
       ? `<span class="badge badge-sold">Выдан • +${fmtMoney((o.total_price||0)-(o.part_cost||0))}</span>`
       : `<span class="badge badge-active">В работе</span>`;
     const actDoneBtn = o.status === 'done'
-      ? `<a href="/api/repair/orders/${o.id}/act/done.pdf" target="_blank" class="btn btn-green btn-sm">Акт работ (PDF)</a>`
+      ? `<button type="button" class="btn btn-green btn-sm" onclick="downloadAct(${o.id}, 'done')">Акт работ (PDF)</button>`
       : `<button class="btn btn-green btn-sm" onclick="markRepDone(${o.id})">Завершить + Акт</button>`;
     return `
       <div class="post-card">
@@ -929,7 +935,7 @@ function renderRepairCRM() {
           <div style="margin-top:8px">${stBadge}</div>
         </div>
         <div class="post-foot">
-          <a href="/api/repair/orders/${o.id}/act/intake.pdf" target="_blank" class="btn btn-dark btn-sm">Акт приёма</a>
+          <button type="button" class="btn btn-dark btn-sm" onclick="downloadAct(${o.id}, 'intake')">Акт приёма</button>
           ${actDoneBtn}
           <button class="btn btn-red btn-sm" onclick="delRepOrder(${o.id})">Удал.</button>
         </div>
@@ -969,26 +975,71 @@ function compressImage(file, maxSide=700, quality=0.72) {
 }
 
 
-function filterDev(q) {
-  const inp = document.getElementById('roDev');
-  inp.value = q + ' ';
-  inp.focus();
-  showDevSuggest();
+const ALL_BRANDS = Array.from(new Set(ALL_DEVICES.map(d => d.split(' ')[0]))).sort();
+const APP_PRESETS = [
+  'Б/у, следы эксплуатации',
+  'Хорошее состояние',
+  'Отличное состояние (как новый)',
+  'Мелкие царапины на дисплее',
+  'Потёртости и царапины по корпусу',
+  'Сильные царапины по корпусу и дисплею',
+  'Сколы / вмятины на корпусе',
+  'Трещина стекла / дисплея',
+  'Разбита задняя крышка',
+  'Следы влаги / коррозии',
+  'Не включается (проверка невозможна)'
+];
+
+function toggleAppPreset(val) {
+  const inp = document.getElementById('roApp');
+  let parts = inp.value.split(',').map(x => x.trim()).filter(Boolean);
+  if (parts.includes(val)) {
+    parts = parts.filter(x => x !== val);
+  } else {
+    parts.push(val);
+  }
+  inp.value = parts.join(', ');
+  document.querySelectorAll('.app-chip').forEach(ch => {
+    ch.style.borderColor = parts.includes(ch.dataset.val) ? '#ff5a1f' : 'rgba(255,255,255,.12)';
+    ch.style.background = parts.includes(ch.dataset.val) ? 'rgba(255,90,31,.22)' : 'rgba(255,255,255,.05)';
+  });
 }
+
 function showDevSuggest() {
   const box = document.getElementById('devSuggest');
   const val = (document.getElementById('roDev').value || '').trim().toLowerCase();
   if (!val) { box.style.display = 'none'; return; }
-  const ruMap = {'айфон':'iphone','самсунг':'samsung','сяоми':'xiaomi','редми':'redmi','поко':'poco','хонор':'honor','хуавей':'huawei','пиксель':'pixel','свитч':'switch','нинтендо':'nintendo','про':'pro','макс':'max','мини':'mini','плюс':'plus','ультра':'ultra'};
+  const ruMap = {
+    'айфон':'iphone','самсунг':'samsung','сяоми':'xiaomi','редми':'redmi','поко':'poco',
+    'хонор':'honor','хуавей':'huawei','пиксель':'pixel','свитч':'switch','нинтендо':'nintendo',
+    'реалми':'realme','оппо':'oppo','ванплас':'oneplus','виво':'vivo','нокиа':'nokia',
+    'сони':'sony','моторола':'motorola','асус':'asus','мейзу':'meizu','текно':'tecno',
+    'инфиникс':'infinix','насинг':'nothing','про':'pro','макс':'max','мини':'mini','плюс':'plus','ультра':'ultra'
+  };
   let norm = val;
   for (const [k,v] of Object.entries(ruMap)) norm = norm.replace(new RegExp(k, 'g'), v);
   const toks = norm.split(/\s+/).filter(Boolean);
+
+  let html = '';
+  if (toks.length === 1) {
+    const brandMatches = ALL_BRANDS.filter(b => b.toLowerCase().includes(toks[0])).slice(0, 5);
+    html += brandMatches.map(b =>
+      `<div style="padding:8px 11px;font-size:13px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.06);color:#ff8a3d;font-weight:700" onclick="pickBrand('${esc(b)}')">Бренд: ${esc(b)} →</div>`
+    ).join('');
+  }
   const matches = ALL_DEVICES.filter(d => toks.every(t => d.toLowerCase().includes(t))).slice(0, 12);
-  if (!matches.length) { box.style.display = 'none'; return; }
-  box.innerHTML = matches.map(m =>
+  html += matches.map(m =>
     `<div style="padding:8px 11px;font-size:13px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.06)" onclick="pickDev('${esc(m)}')">${esc(m)}</div>`
   ).join('');
+  if (!html) { box.style.display = 'none'; return; }
+  box.innerHTML = html;
   box.style.display = 'block';
+}
+function pickBrand(b) {
+  const inp = document.getElementById('roDev');
+  inp.value = b + ' ';
+  inp.focus();
+  showDevSuggest();
 }
 function pickDev(name) {
   document.getElementById('roDev').value = name;
@@ -996,26 +1047,25 @@ function pickDev(name) {
 }
 
 function openNewRepOrder(dev='', pcost=0, tot=0) {
+  const appChips = APP_PRESETS.map(p =>
+    `<button type="button" class="app-chip" data-val="${esc(p)}" onclick="toggleAppPreset('${esc(p)}')" style="padding:5px 9px;font-size:11px;border-radius:9px;border:1px solid ${p==='Б/у, следы эксплуатации'?'#ff5a1f':'rgba(255,255,255,.12)'};background:${p==='Б/у, следы эксплуатации'?'rgba(255,90,31,.22)':'rgba(255,255,255,.05)'};color:#f4f4f5;cursor:pointer;text-align:left">${esc(p)}</button>`
+  ).join('');
   openModal(`
     <h3>Принять устройство в ремонт</h3>
     <div class="field"><label>Имя клиента</label><input id="roCName" placeholder="Алексей"></div>
     <div class="field"><label>Телефон</label><input id="roCPhone" placeholder="+7 999 123-45-67"></div>
     <div class="field" style="position:relative">
-      <label>Устройство / Модель (начните ввод для поиска)</label>
-      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
-        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('iPhone')">Apple</button>
-        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Samsung')">Samsung</button>
-        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Xiaomi')">Xiaomi</button>
-        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Nintendo')">Nintendo</button>
-        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('PlayStation')">PS</button>
-      </div>
-      <input id="roDev" value="${esc(dev)}" placeholder="Напр. 14 pro или Samsung A55..." oninput="showDevSuggest()" autocomplete="off">
-      <div id="devSuggest" style="display:none;max-height:160px;overflow-y:auto;background:#111116;border:1px solid rgba(255,90,31,.45);border-radius:10px;margin-top:4px"></div>
+      <label>Бренд и модель (начните ввод — появятся подсказки)</label>
+      <input id="roDev" value="${esc(dev)}" placeholder="Напр. Samsung A55, 14 pro, Xiaomi..." oninput="showDevSuggest()" autocomplete="off">
+      <div id="devSuggest" style="display:none;max-height:170px;overflow-y:auto;background:#111116;border:1px solid rgba(255,90,31,.45);border-radius:10px;margin-top:4px"></div>
     </div>
     <div class="field"><label>IMEI / Серийный №</label><input id="roImei" placeholder="356789012345678"></div>
     <div class="field"><label>Неисправность</label><input id="roIssue" placeholder="Замена дисплея"></div>
-    <div class="field"><label>Внешний вид</label><input id="roApp" value="Б/у, следы эксплуатации"></div>
-    <div class="field"><label>Комплектация</label><input id="roComp" value="Только устройство"></div>
+    <div class="field">
+      <label>Внешний вид (выберите или допишите)</label>
+      <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px">${appChips}</div>
+      <input id="roApp" value="Б/у, следы эксплуатации">
+    </div>
     <div class="field"><label>Пароль / примечание</label><input id="roPass" placeholder="Код 1234"></div>
     <div class="field"><label>Себестоимость запчасти (₽)</label><input id="roPart" value="${pcost || ''}" placeholder="2100"></div>
     <div class="field"><label>Предоплата (₽)</label><input id="roPrep" value="0"></div>
@@ -1027,6 +1077,33 @@ function openNewRepOrder(dev='', pcost=0, tot=0) {
     </div>
   `);
 }
+async function downloadAct(id, actType) {
+  try {
+    const tgId = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || 0;
+    try {
+      await api('/api/repair/orders/' + id + '/act/' + actType + '/send', 'POST', { tg_id: tgId });
+      toast('PDF-акт отправлен вам в чат с ботом!');
+      return;
+    } catch (_) {}
+    const num = String(id).padStart(4, '0');
+    const fname = (actType === 'intake' ? 'Akt_Priema_' : 'Akt_Rabot_') + num + '.pdf';
+    const res = await fetch('/api/repair/orders/' + id + '/act/' + actType + '.pdf');
+    if (!res.ok) throw new Error('Ошибка скачивания акта (' + res.status + ')');
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = fname;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    toast('Акт скачивается...');
+  } catch (e) {
+    toast(e.message || 'Не удалось скачать акт');
+  }
+}
+
 async function submitNewRepOrder() {
   const device_model = document.getElementById('roDev').value.trim();
   if (!device_model) { toast('Укажите модель устройства'); return; }
@@ -1037,7 +1114,7 @@ async function submitNewRepOrder() {
     imei_sn: document.getElementById('roImei').value.trim(),
     issue_desc: document.getElementById('roIssue').value.trim(),
     appearance: document.getElementById('roApp').value.trim(),
-    completeness: document.getElementById('roComp').value.trim(),
+    completeness: '',
     passcode_note: document.getElementById('roPass').value.trim(),
     part_cost: document.getElementById('roPart').value.trim(),
     prepayment: document.getElementById('roPrep').value.trim(),
@@ -1046,13 +1123,13 @@ async function submitNewRepOrder() {
   });
   closeModal(); toast('Заказ принят!');
   await loadAll();
-  window.open('/api/repair/orders/' + res.id + '/act/intake.pdf', '_blank');
+  await downloadAct(res.id, 'intake');
 }
 async function markRepDone(id) {
   await api('/api/repair/orders/' + id + '/done', 'POST');
   toast('Ремонт завершён!');
   await loadAll();
-  window.open('/api/repair/orders/' + id + '/act/done.pdf', '_blank');
+  await downloadAct(id, 'done');
 }
 async function delRepOrder(id) {
   if (!confirm('Удалить заказ?')) return;
@@ -1247,7 +1324,7 @@ loadAll();
 
 def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Application:
     app = web.Application(client_max_size=25 * 1024 * 1024)
-    no_cache = {"Cache-Control": "no-store, no-cache, must-revalidate"}
+    no_cache = {"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0", "Pragma": "no-cache", "Expires": "0"}
 
     def _secret() -> str:
         return deps["get_setting"]("web_secret") or WEB_PASSWORD or "qcrm_fallback_key"
@@ -1284,7 +1361,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
     @web.middleware
     async def auth_mw(request: web.Request, handler):
-        if request.path in ("/login", "/logout", "/health"):
+        if request.path in ("/login", "/logout", "/health") or (request.path.startswith("/api/repair/orders/") and request.path.endswith(".pdf") and request.query.get("t")):
             return await handler(request)
         cookie = request.cookies.get(COOKIE_NAME, "")
         sess = _verify_cookie(cookie, _secret())
@@ -1360,8 +1437,9 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         all_ships = []
         unsold_my = []
         if perms["can_crm"]:
+            ship_filter_hash = None if is_owner else sess["user_hash"]
             for status in ("active", "archived"):
-                for s in deps["get_shipments"](status):
+                for s in deps["get_shipments"](status, ship_filter_hash):
                     sd = dict(s)
                     if not is_owner:
                         sd["delivery_cost"] = 0
@@ -1457,6 +1535,10 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.json_response({"ok": True})
 
     # --- CRM Отправки ---
+    def _can_ship(request: web.Request, ship_id: int) -> bool:
+        sess = request["session"]
+        return deps["can_access_shipment_by_hash"](sess["user_hash"], sess["role"] == "owner", ship_id)
+
     async def handle_create_shipment(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
@@ -1464,12 +1546,14 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         name = str(body.get("name", "")).strip()
         if not name:
             return web.json_response({"error": "Введите название"}, status=400)
-        return web.json_response({"id": deps["create_shipment"](0, name)})
+        return web.json_response({"id": deps["create_shipment_by_hash"](request["session"]["user_hash"], name)})
 
     async def handle_arrive_shipment(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         ship_id = int(request.match_info["id"])
+        if not _can_ship(request, ship_id):
+            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         cost = deps["parse_amount"](str(body.get("delivery_cost", "0"))) if request["session"]["role"] == "owner" else 0.0
         deps["archive_shipment"](ship_id, cost)
@@ -1479,6 +1563,8 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         ship_id = int(request.match_info["id"])
+        if not _can_ship(request, ship_id):
+            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         iid = deps["create_item"](ship_id, str(body.get("name", "")), str(body.get("track_number", "")))
         if body.get("owner_type", "my") == "my":
@@ -1491,6 +1577,9 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         item_id = int(request.match_info["id"])
+        item = deps["get_item"](item_id)
+        if not item or not _can_ship(request, int(item["shipment_id"])):
+            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         deps["update_item_name"](item_id, str(body.get("name", "")))
         deps["update_item_track"](item_id, str(body.get("track_number", "")))
@@ -1503,7 +1592,11 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     async def handle_delete_item(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
-        deps["delete_item"](int(request.match_info["id"]))
+        item_id = int(request.match_info["id"])
+        item = deps["get_item"](item_id)
+        if not item or not _can_ship(request, int(item["shipment_id"])):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["delete_item"](item_id)
         return web.json_response({"ok": True})
 
     async def handle_sell_item(request: web.Request) -> web.Response:
@@ -1640,9 +1733,28 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         deps["delete_repair_order"](int(request.match_info["id"]))
         return web.json_response({"ok": True})
 
+    def _make_act_token(oid: int, act_type: str) -> str:
+        exp = int(time.time()) + 3600
+        sig = _sign_payload(f"act:{oid}:{act_type}:{exp}", _secret())
+        return f"{exp}.{sig}"
+
+    def _verify_act_token(token: str, oid: int, act_type: str) -> bool:
+        try:
+            exp_s, sig = token.split(".", 1)
+            if int(exp_s) < int(time.time()):
+                return False
+            expected = _sign_payload(f"act:{oid}:{act_type}:{exp_s}", _secret())
+            return hmac.compare_digest(sig, expected)
+        except Exception:
+            return False
+
     async def handle_get_act_pdf(request: web.Request) -> web.Response:
-        if not _has_perm(request, "can_repair_crm"):
-            return web.Response(status=403)
+        oid = int(request.match_info["id"])
+        act_type = request.match_info["act_type"]
+        tok = request.query.get("t", "")
+        if not _verify_act_token(tok, oid, act_type):
+            if not request.get("session") or not _has_perm(request, "can_repair_crm"):
+                return web.json_response({"error": "Unauthorized"}, status=401)
         oid = int(request.match_info["id"])
         act_type = request.match_info["act_type"]
         if act_type not in ("intake", "done"):
@@ -1651,11 +1763,36 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         if not order:
             return web.Response(status=404)
         pdf_bytes = deps["generate_act_pdf"](dict(order), act_type, _DEFAULT_LOGO_B64)
+        fname = f"{'Akt_Priema' if act_type == 'intake' else 'Akt_Rabot'}_{str(oid).zfill(4)}.pdf"
         return web.Response(
             body=pdf_bytes,
             content_type="application/pdf",
-            headers={"Content-Disposition": f'inline; filename="QHead_Act_{oid}_{act_type}.pdf"'},
+            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
         )
+
+    async def handle_send_act_pdf(request: web.Request) -> web.Response:
+        if not _has_perm(request, "can_repair_crm"):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        oid = int(request.match_info["id"])
+        act_type = request.match_info["act_type"]
+        if act_type not in ("intake", "done"):
+            return web.json_response({"error": "Bad act type"}, status=400)
+        body = await request.json()
+        tg_id = int(body.get("tg_id") or 0)
+        if not tg_id and request["session"]["role"] == "owner":
+            tg_id = deps["get_owner_tg_id"]()
+        expected_h = deps["get_owner_hash"]() if request["session"]["role"] == "owner" else request["session"]["user_hash"]
+        if not tg_id or not expected_h or deps["hash_user_id"](tg_id) != expected_h:
+            return web.json_response({"error": "Forbidden"}, status=403)
+        order = deps["get_repair_order_by_id"](oid)
+        if not order:
+            return web.json_response({"error": "Not found"}, status=404)
+        pdf_bytes = deps["generate_act_pdf"](dict(order), act_type, _DEFAULT_LOGO_B64)
+        num = str(oid).zfill(4)
+        fname = f"{'Akt_Priema' if act_type == 'intake' else 'Akt_Rabot'}_{num}.pdf"
+        cap = f"📄 {'Акт приёма в ремонт' if act_type == 'intake' else 'Акт выполненных работ'} №{num}"
+        await bot.send_document(chat_id=tg_id, document=BufferedInputFile(pdf_bytes, filename=fname), caption=cap)
+        return web.json_response({"ok": True})
 
     app.router.add_get("/health", handle_health)
     app.router.add_get("/logout", handle_logout)
@@ -1683,6 +1820,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/api/repair/orders/{id}/done", handle_done_rep_order)
     app.router.add_delete("/api/repair/orders/{id}", handle_del_rep_order)
     app.router.add_get("/api/repair/orders/{id}/act/{act_type}.pdf", handle_get_act_pdf)
+    app.router.add_post("/api/repair/orders/{id}/act/{act_type}/send", handle_send_act_pdf)
     return app
 
 

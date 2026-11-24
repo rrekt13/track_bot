@@ -390,6 +390,26 @@ def set_setting(key: str, value: str) -> None:
         conn.commit()
 
 
+def get_owner_tg_id() -> int:
+    if ENV_ADMIN_ID.isdigit():
+        return int(ENV_ADMIN_ID)
+    val = get_setting("owner_tg_id")
+    return int(val) if val.isdigit() else 0
+
+
+async def safe_edit_or_send(msg: Message, text: str, reply_markup=None, **kwargs) -> None:
+    if msg.text:
+        try:
+            await msg.edit_text(text, reply_markup=reply_markup, **kwargs)
+            return
+        except TelegramBadRequest as e:
+            if "no text in the message to edit" not in str(e).lower() and "message is not modified" not in str(e).lower():
+                raise
+            if "message is not modified" in str(e).lower():
+                return
+    await msg.answer(text, reply_markup=reply_markup, **kwargs)
+
+
 def get_owner_hash() -> Optional[str]:
     return get_setting("owner_hash")
 
@@ -545,8 +565,7 @@ def mark_post_sold(channel_id: str, message_id: int, new_text: str, new_entities
 
 # --- Работа с отправками и товарами CRM ---
 
-def create_shipment(user_id: int, name: str) -> int:
-    uid_hash = hash_user_id(user_id)
+def create_shipment_by_hash(uid_hash: str, name: str) -> int:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
             "INSERT INTO shipments (user_id, name, status) VALUES (?, ?, 'active')",
@@ -556,20 +575,49 @@ def create_shipment(user_id: int, name: str) -> int:
         return cur.lastrowid
 
 
+def create_shipment(user_id: int, name: str) -> int:
+    return create_shipment_by_hash(hash_user_id(user_id), name)
+
+
 def get_shipment(shipment_id: int) -> Optional[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
 
 
-def get_shipments(status: str = "active") -> list[sqlite3.Row]:
+def can_access_shipment_by_hash(user_hash: str, is_owner: bool, shipment_id: int) -> bool:
+    if is_owner:
+        return True
+    s = get_shipment(shipment_id)
+    return bool(s and s["user_id"] == user_hash)
+
+
+def can_access_shipment(user_id: int, shipment_id: int) -> bool:
+    return can_access_shipment_by_hash(hash_user_id(user_id), is_main_admin(user_id), shipment_id)
+
+
+def get_shipments(status: str = "active", user_hash: Optional[str] = None) -> list[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
+        if user_hash:
+            return conn.execute(
+                """
+                SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
+                FROM shipments s
+                LEFT JOIN items i ON i.shipment_id = s.id
+                LEFT JOIN admins a ON a.user_hash = s.user_id
+                WHERE s.status = ? AND s.user_id = ?
+                GROUP BY s.id
+                ORDER BY s.id DESC
+                """,
+                (status, user_hash),
+            ).fetchall()
         return conn.execute(
             """
-            SELECT s.*, COUNT(i.id) AS item_count
+            SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
             FROM shipments s
             LEFT JOIN items i ON i.shipment_id = s.id
+            LEFT JOIN admins a ON a.user_hash = s.user_id
             WHERE s.status = ?
             GROUP BY s.id
             ORDER BY s.id DESC
@@ -1048,7 +1096,6 @@ class RepairFSM(StatesGroup):
     waiting_order_imei = State()
     waiting_order_issue = State()
     waiting_order_appearance = State()
-    waiting_order_completeness = State()
     waiting_order_passcode = State()
     waiting_order_part_cost = State()
     waiting_order_prepay = State()
@@ -1089,8 +1136,9 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 
 
 def crm_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    active = get_shipments("active")
-    archived = get_shipments("archived")
+    uhash = None if is_main_admin(user_id) else hash_user_id(user_id)
+    active = get_shipments("active", uhash)
+    archived = get_shipments("archived", uhash)
 
     rows = [[InlineKeyboardButton(text="📦 Создать отправку", callback_data="create_shipment")]]
 
@@ -1728,9 +1776,30 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
     if not has_perm(message.from_user.id, "can_parts_search"):
         return
     query = message.text.strip()
-    wait_msg = await message.answer("⏳ Ищу запчасти на Master Mobile, Moba и MEMS...")
+    wait_msg = await message.answer("⏳ Ищу запчасти на Moba...")
+    await state.clear()
 
-    res = await search_parts_all(query)
+    try:
+        res = await asyncio.wait_for(search_parts_all(query), timeout=10.0)
+    except Exception as e:
+        logger.warning(f"Bot parts search failed/timeout for {query}: {e}")
+        from urllib.parse import quote_plus
+        q_enc = quote_plus(query)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Открыть Moba", url=f"https://moba.ru/catalog/?q={q_enc}"),
+                ],
+                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
+            ]
+        )
+        await wait_msg.edit_text(
+            f"⚠️ Сайты поставщиков отвечают слишком долго. Откройте поиск по запросу <b>{h(query)}</b> напрямую:",
+            reply_markup=kb,
+        )
+        return
+
     prices = [dict(r) for r in get_repair_prices()]
     work_title, work_price = match_work_price(query, prices)
 
@@ -1745,11 +1814,11 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
             note = f" (HTTP {st})" if st and st != 200 else ""
             lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
         else:
-            for it in items[:4]:
+            for it in items[:3]:
                 total = it["price"] + work_price
                 stock = "✅" if it["in_stock"] else "⏳"
                 lines.append(
-                    f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'])}</a>\n"
+                    f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'][:85])}</a>\n"
                     f"   Качество: <b>{h(it['quality'])}</b>\n"
                     f"   <sub>Запчасть: {fmt_money(it['price'])}</sub> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
                 )
@@ -1759,16 +1828,19 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="Master Mobile", url=urls["master_mobile"]),
-                InlineKeyboardButton(text="Moba", url=urls["moba"]),
-                InlineKeyboardButton(text="MEMS", url=urls["mems"]),
+                InlineKeyboardButton(text="Открыть Moba", url=urls["moba"]),
             ],
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
         ]
     )
-    await state.clear()
-    await wait_msg.edit_text("\n".join(lines), reply_markup=kb, disable_web_page_preview=True)
+    txt = "\n".join(lines)
+    if len(txt) > 3900:
+        txt = txt[:3900] + "\n..."
+    try:
+        await wait_msg.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
+    except Exception:
+        await message.answer(txt, reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "rep_prices")
@@ -1886,7 +1958,7 @@ async def cb_rep_orders(callback: CallbackQuery) -> None:
             else:
                 rows.append([InlineKeyboardButton(text=f"📄 Акт работ №{num}", callback_data=f"rep_pdf_done:{o['id']}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_crm_menu")])
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await safe_edit_or_send(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -1895,7 +1967,8 @@ async def cb_rep_new_order(callback: CallbackQuery, state: FSMContext) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     await state.set_state(RepairFSM.waiting_order_client_name)
-    await callback.message.edit_text(
+    await safe_edit_or_send(
+        callback.message,
         "👤 Введите <b>Имя клиента</b>:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="repair_crm_menu")]]
@@ -1961,25 +2034,42 @@ async def msg_rep_oimei(message: Message, state: FSMContext) -> None:
     await message.answer("🛠 Неисправность / что нужно сделать:")
 
 
+APPEARANCE_PRESETS_BOT = [
+    "Б/у, следы эксплуатации",
+    "Хорошее состояние",
+    "Сильные царапины по корпусу и дисплею",
+    "Сколы / вмятины на корпусе",
+    "Трещина стекла / дисплея",
+    "Следы влаги / не включается",
+]
+
 @router.message(RepairFSM.waiting_order_issue, F.text)
 async def msg_rep_oissue(message: Message, state: FSMContext) -> None:
     await state.update_data(issue_desc=message.text.strip())
     await state.set_state(RepairFSM.waiting_order_appearance)
-    await message.answer("👀 Внешний вид (например: <i>Потёртости, сколы</i> или <code>-</code>):")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=p, callback_data=f"rep_app:{i}")]
+            for i, p in enumerate(APPEARANCE_PRESETS_BOT)
+        ]
+    )
+    await message.answer("👀 Выберите внешний вид или напишите свой вариант:", reply_markup=kb)
+
+
+@router.callback_query(RepairFSM.waiting_order_appearance, F.data.startswith("rep_app:"))
+async def cb_rep_oapp(callback: CallbackQuery, state: FSMContext) -> None:
+    idx = int(callback.data.split(":", 1)[1])
+    val = APPEARANCE_PRESETS_BOT[idx] if 0 <= idx < len(APPEARANCE_PRESETS_BOT) else "Б/у, следы эксплуатации"
+    await state.update_data(appearance=val, completeness="")
+    await state.set_state(RepairFSM.waiting_order_passcode)
+    await callback.message.answer(f"👀 Внешний вид: <b>{h(val)}</b>\n\n🔐 Пароль от устройства / примечание (или <code>-</code>):")
+    await callback.answer()
 
 
 @router.message(RepairFSM.waiting_order_appearance, F.text)
 async def msg_rep_oapp(message: Message, state: FSMContext) -> None:
     val = "Б/у, следы эксплуатации" if message.text.strip() == "-" else message.text.strip()
-    await state.update_data(appearance=val)
-    await state.set_state(RepairFSM.waiting_order_completeness)
-    await message.answer("📦 Комплектация (например: <i>Только устройство</i> или <code>-</code>):")
-
-
-@router.message(RepairFSM.waiting_order_completeness, F.text)
-async def msg_rep_ocomp(message: Message, state: FSMContext) -> None:
-    val = "Только устройство" if message.text.strip() == "-" else message.text.strip()
-    await state.update_data(completeness=val)
+    await state.update_data(appearance=val, completeness="")
     await state.set_state(RepairFSM.waiting_order_passcode)
     await message.answer("🔐 Пароль от устройства / примечание (или <code>-</code>):")
 
@@ -2035,7 +2125,7 @@ async def _finalize_repair_order(target, state: FSMContext, warranty_days: int) 
         imei_sn=data["imei_sn"],
         issue_desc=data["issue_desc"],
         appearance=data["appearance"],
-        completeness=data["completeness"],
+        completeness=data.get("completeness", ""),
         passcode_note=data["passcode_note"],
         prepayment=data["prepayment"],
         warranty_days=warranty_days,
@@ -2087,13 +2177,20 @@ async def cb_rep_pdf_done(callback: CallbackQuery) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     oid = int(callback.data.split(":")[1])
-    order = dict(get_repair_order_by_id(oid))
-    pdf_bytes = generate_act_pdf(order, "done")
-    num = str(oid).zfill(4)
-    await callback.message.answer_document(
-        BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
-    )
-    await callback.answer()
+    row = get_repair_order_by_id(oid)
+    if not row:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    try:
+        pdf_bytes = generate_act_pdf(dict(row), "done")
+        num = str(oid).zfill(4)
+        await callback.message.answer_document(
+            BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
+        )
+        await callback.answer("Акт отправлен")
+    except Exception as e:
+        logger.exception(f"PDF generation error for order {oid}: {e}")
+        await callback.answer(f"Ошибка PDF: {e}", show_alert=True)
 
 
 # ===========================================================================
@@ -3105,7 +3202,8 @@ async def msg_delivery_cost(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "archive_list")
 async def cb_archive_list(callback: CallbackQuery) -> None:
-    archived = get_shipments("archived")
+    uhash = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
+    archived = get_shipments("archived", uhash)
     if not archived:
         await callback.message.edit_text(
             "Архив пуст.",
@@ -3155,6 +3253,7 @@ async def main() -> None:
     web_deps = {
         "get_crm_finances": get_crm_finances,
         "get_owner_hash": get_owner_hash,
+        "get_owner_tg_id": get_owner_tg_id,
         "find_admin_by_web_password": find_admin_by_web_password,
         "get_admin_by_hash": get_admin_by_hash,
         "get_setting": get_setting,
@@ -3176,7 +3275,11 @@ async def main() -> None:
         "mark_personal_sold_by_hash": mark_personal_sold_by_hash,
         "delete_personal_entry_by_hash": delete_personal_entry_by_hash,
         "get_shipments": get_shipments,
+        "create_shipment_by_hash": create_shipment_by_hash,
+        "can_access_shipment_by_hash": can_access_shipment_by_hash,
         "get_items": get_items,
+        "get_item": get_item,
+        "hash_user_id": hash_user_id,
         "get_setting": get_setting,
         "save_post": save_post,
         "get_all_posts": get_all_posts,
