@@ -7,14 +7,12 @@ import logging
 import os
 import re
 import sqlite3
-import time
 from contextlib import closing
 from html import escape as h
 from acts import generate_act_pdf
 from devices_catalog import search_devices
 from repair import match_work_price, search_parts_all
-from service_tools import analyze_panic_log, check_imei_info, extract_imei_highlights
-from typing import Any, Optional
+from typing import Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -354,28 +352,6 @@ def init_db() -> None:
         if "photo_ref" not in pe_cols:
             conn.execute("ALTER TABLE personal_entries ADD COLUMN photo_ref TEXT DEFAULT ''")
 
-        if "tg_id" not in admin_cols:
-            conn.execute("ALTER TABLE admins ADD COLUMN tg_id INTEGER NOT NULL DEFAULT 0")
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS tasks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                task_type TEXT NOT NULL,
-                title TEXT NOT NULL,
-                payload_json TEXT NOT NULL DEFAULT '{}',
-                photo_ref TEXT DEFAULT '',
-                assignees_json TEXT NOT NULL DEFAULT '[]',
-                interval_minutes INTEGER NOT NULL DEFAULT 60,
-                status TEXT NOT NULL DEFAULT 'active',
-                created_by TEXT NOT NULL DEFAULT '',
-                last_reminded_at INTEGER NOT NULL DEFAULT 0,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                done_at TIMESTAMP DEFAULT NULL
-            );
-            """
-        )
-
         if ENV_ADMIN_ID.isdigit():
             conn.execute(
                 "INSERT OR REPLACE INTO settings (key, value) VALUES ('owner_hash', ?)",
@@ -412,26 +388,6 @@ def set_setting(key: str, value: str) -> None:
             (key, value),
         )
         conn.commit()
-
-
-def get_owner_tg_id() -> int:
-    if ENV_ADMIN_ID.isdigit():
-        return int(ENV_ADMIN_ID)
-    val = get_setting("owner_tg_id")
-    return int(val) if val.isdigit() else 0
-
-
-async def safe_edit_or_send(msg: Message, text: str, reply_markup=None, **kwargs) -> None:
-    if msg.text:
-        try:
-            await msg.edit_text(text, reply_markup=reply_markup, **kwargs)
-            return
-        except TelegramBadRequest as e:
-            if "no text in the message to edit" not in str(e).lower() and "message is not modified" not in str(e).lower():
-                raise
-            if "message is not modified" in str(e).lower():
-                return
-    await msg.answer(text, reply_markup=reply_markup, **kwargs)
 
 
 def get_owner_hash() -> Optional[str]:
@@ -589,7 +545,8 @@ def mark_post_sold(channel_id: str, message_id: int, new_text: str, new_entities
 
 # --- Работа с отправками и товарами CRM ---
 
-def create_shipment_by_hash(uid_hash: str, name: str) -> int:
+def create_shipment(user_id: int, name: str) -> int:
+    uid_hash = hash_user_id(user_id)
     with closing(sqlite3.connect(DB_PATH)) as conn:
         cur = conn.execute(
             "INSERT INTO shipments (user_id, name, status) VALUES (?, ?, 'active')",
@@ -599,49 +556,20 @@ def create_shipment_by_hash(uid_hash: str, name: str) -> int:
         return cur.lastrowid
 
 
-def create_shipment(user_id: int, name: str) -> int:
-    return create_shipment_by_hash(hash_user_id(user_id), name)
-
-
 def get_shipment(shipment_id: int) -> Optional[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
         return conn.execute("SELECT * FROM shipments WHERE id = ?", (shipment_id,)).fetchone()
 
 
-def can_access_shipment_by_hash(user_hash: str, is_owner: bool, shipment_id: int) -> bool:
-    if is_owner:
-        return True
-    s = get_shipment(shipment_id)
-    return bool(s and s["user_id"] == user_hash)
-
-
-def can_access_shipment(user_id: int, shipment_id: int) -> bool:
-    return can_access_shipment_by_hash(hash_user_id(user_id), is_main_admin(user_id), shipment_id)
-
-
-def get_shipments(status: str = "active", user_hash: Optional[str] = None) -> list[sqlite3.Row]:
+def get_shipments(status: str = "active") -> list[sqlite3.Row]:
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        if user_hash:
-            return conn.execute(
-                """
-                SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
-                FROM shipments s
-                LEFT JOIN items i ON i.shipment_id = s.id
-                LEFT JOIN admins a ON a.user_hash = s.user_id
-                WHERE s.status = ? AND s.user_id = ?
-                GROUP BY s.id
-                ORDER BY s.id DESC
-                """,
-                (status, user_hash),
-            ).fetchall()
         return conn.execute(
             """
-            SELECT s.*, COUNT(i.id) AS item_count, COALESCE(a.label, '') AS creator_name
+            SELECT s.*, COUNT(i.id) AS item_count
             FROM shipments s
             LEFT JOIN items i ON i.shipment_id = s.id
-            LEFT JOIN admins a ON a.user_hash = s.user_id
             WHERE s.status = ?
             GROUP BY s.id
             ORDER BY s.id DESC
@@ -1063,195 +991,6 @@ def delete_repair_order(order_id: int) -> None:
         conn.commit()
 
 
-# --- Задачи и напоминания ---
-
-def get_assignable_people() -> list[dict[str, Any]]:
-    people: list[dict[str, Any]] = [{
-        "user_hash": get_owner_hash() or "owner",
-        "label": "Я (Владелец)",
-        "tg_id": get_owner_tg_id(),
-    }]
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        for r in conn.execute("SELECT user_hash, label, tg_id FROM admins ORDER BY id ASC").fetchall():
-            people.append({"user_hash": r["user_hash"], "label": r["label"], "tg_id": int(r["tg_id"] or 0)})
-    return people
-
-
-def create_task(
-    task_type: str,
-    title: str,
-    payload: dict[str, Any],
-    assignees: list[str],
-    interval_minutes: int,
-    created_by: str,
-    photo_ref: str = "",
-) -> int:
-    now_ts = int(time.time())
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        cur = conn.execute(
-            """
-            INSERT INTO tasks (task_type, title, payload_json, photo_ref, assignees_json, interval_minutes, status, created_by, last_reminded_at)
-            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
-            """,
-            (
-                task_type,
-                title.strip(),
-                json.dumps(payload, ensure_ascii=False),
-                photo_ref.strip(),
-                json.dumps(assignees, ensure_ascii=False),
-                max(0, int(interval_minutes)),
-                created_by,
-                now_ts,
-            ),
-        )
-        conn.commit()
-        return cur.lastrowid
-
-
-def get_tasks(status: Optional[str] = None, user_hash: Optional[str] = None) -> list[dict[str, Any]]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        if status:
-            rows = conn.execute("SELECT * FROM tasks WHERE status = ? ORDER BY id DESC LIMIT 40", (status,)).fetchall()
-        else:
-            rows = conn.execute("SELECT * FROM tasks ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, id DESC LIMIT 40").fetchall()
-    out: list[dict[str, Any]] = []
-    for r in rows:
-        d = dict(r)
-        try:
-            d["payload"] = json.loads(d.get("payload_json") or "{}")
-        except Exception:
-            d["payload"] = {}
-        try:
-            d["assignees"] = json.loads(d.get("assignees_json") or "[]")
-        except Exception:
-            d["assignees"] = []
-        if user_hash and user_hash not in d["assignees"] and d.get("created_by") != user_hash:
-            continue
-        out.append(d)
-    return out
-
-
-def get_task_by_id(task_id: int) -> Optional[dict[str, Any]]:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.row_factory = sqlite3.Row
-        r = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if not r:
-        return None
-    d = dict(r)
-    try:
-        d["payload"] = json.loads(d.get("payload_json") or "{}")
-    except Exception:
-        d["payload"] = {}
-    try:
-        d["assignees"] = json.loads(d.get("assignees_json") or "[]")
-    except Exception:
-        d["assignees"] = []
-    return d
-
-
-def mark_task_done(task_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("UPDATE tasks SET status = 'done', done_at = CURRENT_TIMESTAMP WHERE id = ?", (task_id,))
-        conn.commit()
-
-
-def delete_task(task_id: int) -> None:
-    with closing(sqlite3.connect(DB_PATH)) as conn:
-        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        conn.commit()
-
-
-def format_task_html(t: dict[str, Any], is_reminder: bool = False) -> str:
-    p = t.get("payload") or {}
-    ttype = t.get("task_type")
-    hdr = "🔔 <b>НАПОМИНАНИЕ ПО ЗАДАЧЕ</b>" if is_reminder else "📋 <b>НОВАЯ ЗАДАЧА</b>"
-    num = str(t["id"]).zfill(3)
-    if ttype == "ship":
-        body = (
-            f"📦 <b>Отправить товар клиенту</b> (#{num})\n"
-            f"• <b>Пункт выдачи:</b> {h(p.get('pickup', '—'))}\n"
-            f"• <b>Товар:</b> {h(p.get('item', '—'))}\n"
-            f"• <b>Комплектация и где лежит:</b> {h(p.get('location', '—'))}"
-        )
-    elif ttype == "handover":
-        body = (
-            f"🤝 <b>Передать товар клиенту</b> (#{num})\n"
-            f"• <b>Время:</b> {h(p.get('time', '—'))}\n"
-            f"• <b>Товар:</b> {h(p.get('item', '—'))}\n"
-            f"• <b>Комплектация и где лежит:</b> {h(p.get('location', '—'))}"
-        )
-    else:
-        items = p.get("items") or []
-        tot = sum(float(x.get("price") or 0) for x in items)
-        lines = [f"  {i}. {h(x.get('name',''))} — <b>{fmt_money(x.get('price',0))}</b>" for i, x in enumerate(items, 1)]
-        body = (
-            f"🛒 <b>Купить запчасти</b> (#{num})\n"
-            f"• <b>Где купить:</b> {h(p.get('place', '—'))}\n"
-            + ("\n".join(lines) if lines else "• Список пуст")
-            + f"\n• <b>Итого:</b> {fmt_money(tot)}"
-        )
-    iv = int(t.get("interval_minutes") or 0)
-    iv_txt = f"каждые {iv} мин." if iv > 0 else "без повторов"
-    return f"{hdr}\n\n{body}\n\n⏱ <i>Напоминания: {iv_txt}</i>"
-
-
-async def send_task_notification(bot: Bot, task_id: int, is_reminder: bool = False) -> None:
-    t = get_task_by_id(task_id)
-    if not t or t["status"] != "active":
-        return
-    people = {p["user_hash"]: p["tg_id"] for p in get_assignable_people()}
-    owner_id = get_owner_tg_id()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Задача выполнена", callback_data=f"task_done:{task_id}")]])
-    txt = format_task_html(t, is_reminder=is_reminder)
-    pref = t.get("photo_ref") or ""
-    targets: set[int] = set()
-    for uh in t.get("assignees", []):
-        if uh in ("owner", get_owner_hash()):
-            if owner_id:
-                targets.add(owner_id)
-        elif people.get(uh):
-            targets.add(int(people[uh]))
-    for chat_id in targets:
-        try:
-            if pref:
-                if pref.startswith("web_"):
-                    fpath = os.path.join(os.path.dirname(DB_PATH) or ".", "web_photos", pref)
-                    if os.path.isfile(fpath):
-                        with open(fpath, "rb") as pf:
-                            await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(pf.read(), filename=pref), caption=txt, reply_markup=kb)
-                        continue
-                else:
-                    await bot.send_photo(chat_id=chat_id, photo=pref, caption=txt, reply_markup=kb)
-                    continue
-            await bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
-        except Exception as e:
-            logger.warning(f"Task {task_id} notify error for {chat_id}: {e}")
-
-
-async def _tasks_reminder_loop(bot: Bot) -> None:
-    while True:
-        try:
-            await asyncio.sleep(45)
-            now_ts = int(time.time())
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                conn.row_factory = sqlite3.Row
-                due = conn.execute(
-                    "SELECT id, interval_minutes, last_reminded_at FROM tasks WHERE status = 'active' AND interval_minutes > 0"
-                ).fetchall()
-            for r in due:
-                if now_ts - int(r["last_reminded_at"] or 0) >= int(r["interval_minutes"]) * 60:
-                    with closing(sqlite3.connect(DB_PATH)) as conn:
-                        conn.execute("UPDATE tasks SET last_reminded_at = ? WHERE id = ?", (now_ts, r["id"]))
-                        conn.commit()
-                    await send_task_notification(bot, r["id"], is_reminder=True)
-        except asyncio.CancelledError:
-            break
-        except Exception as e:
-            logger.warning(f"Tasks reminder loop error: {e}")
-
-
 # ---------------------------------------------------------------------------
 # Middleware проверки доступа
 # ---------------------------------------------------------------------------
@@ -1265,13 +1004,6 @@ class AccessMiddleware(BaseMiddleware):
             set_owner_if_empty(user.id)
         if not is_admin(user.id):
             return
-        if is_main_admin(user.id):
-            if not get_setting("owner_tg_id"):
-                set_setting("owner_tg_id", str(user.id))
-        else:
-            with closing(sqlite3.connect(DB_PATH)) as conn:
-                conn.execute("UPDATE admins SET tg_id = ? WHERE user_hash = ? AND tg_id = 0", (user.id, hash_user_id(user.id)))
-                conn.commit()
         return await handler(event, data)
 
 
@@ -1304,26 +1036,6 @@ class PostFSM(StatesGroup):
     waiting_post_sold_price = State()
 
 
-class ServiceFSM(StatesGroup):
-    waiting_imei = State()
-    waiting_panic = State()
-
-
-class TaskFSM(StatesGroup):
-    waiting_ship_pickup = State()
-    waiting_ship_item = State()
-    waiting_ship_loc = State()
-    waiting_ship_photo = State()
-    waiting_hand_time = State()
-    waiting_hand_item = State()
-    waiting_hand_loc = State()
-    waiting_buy_place = State()
-    waiting_buy_item_name = State()
-    waiting_buy_item_price = State()
-    waiting_assignees = State()
-    waiting_interval = State()
-
-
 class RepairFSM(StatesGroup):
     waiting_search_query = State()
     waiting_new_price_title = State()
@@ -1336,6 +1048,7 @@ class RepairFSM(StatesGroup):
     waiting_order_imei = State()
     waiting_order_issue = State()
     waiting_order_appearance = State()
+    waiting_order_completeness = State()
     waiting_order_passcode = State()
     waiting_order_part_cost = State()
     waiting_order_prepay = State()
@@ -1362,8 +1075,10 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📦 CRM", callback_data="crm_menu")])
     if has_perm(user_id, "can_post"):
         rows.append([InlineKeyboardButton(text="📝 Создать/Редактировать пост", callback_data="posts_menu")])
-    if has_perm(user_id, "can_parts_search") or has_perm(user_id, "can_repair_crm"):
-        rows.append([InlineKeyboardButton(text="🛠 Сервис", callback_data="service_menu")])
+    if has_perm(user_id, "can_parts_search"):
+        rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
+    if has_perm(user_id, "can_repair_crm"):
+        rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
     if has_perm(user_id, "can_personal_ledger"):
         rows.append([InlineKeyboardButton(text="💼 Мой учёт", callback_data="personal_menu")])
     if WEB_URL:
@@ -1374,9 +1089,8 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
 
 
 def crm_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    uhash = None if is_main_admin(user_id) else hash_user_id(user_id)
-    active = get_shipments("active", uhash)
-    archived = get_shipments("archived", uhash)
+    active = get_shipments("active")
+    archived = get_shipments("archived")
 
     rows = [[InlineKeyboardButton(text="📦 Создать отправку", callback_data="create_shipment")]]
 
@@ -1947,26 +1661,12 @@ async def cb_pers_stats(callback: CallbackQuery) -> None:
 # РАЗДЕЛ 3: ПОИСК ЗАПЧАСТЕЙ И СРМ РЕМОНТ (РАЗДЕЛЬНЫЕ ВКЛАДКИ И ПРАВА)
 # ===========================================================================
 
-def service_menu_kb(user_id: int) -> InlineKeyboardMarkup:
-    rows = []
-    if has_perm(user_id, "can_repair_crm"):
-        rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
-    if has_perm(user_id, "can_parts_search"):
-        rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
-    if has_perm(user_id, "can_parts_search") or has_perm(user_id, "can_repair_crm"):
-        rows.append([InlineKeyboardButton(text="📱 Проверка IMEI / iCloud", callback_data="srv_imei")])
-        rows.append([InlineKeyboardButton(text="🩺 Разбор Panic-логов", callback_data="srv_panic")])
-        rows.append([InlineKeyboardButton(text="📋 Задачи", callback_data="tasks_menu")])
-    rows.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
 def parts_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Найти запчасть (Moba)", callback_data="rep_search")],
+            [InlineKeyboardButton(text="🔍 Найти запчасть (MM / Moba / MEMS)", callback_data="rep_search")],
             [InlineKeyboardButton(text="💰 Прайс за нашу работу", callback_data="rep_prices")],
-            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
         ]
     )
 
@@ -1975,472 +1675,10 @@ def repair_crm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Принять устройство в ремонт", callback_data="rep_new_order")],
-            [InlineKeyboardButton(text="📋 Заказы и акты", callback_data="rep_orders")],
-            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
+            [InlineKeyboardButton(text="📋 Заказы в ремонте и акты", callback_data="rep_orders")],
+            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
         ]
     )
-
-
-@router.callback_query(F.data == "service_menu")
-async def cb_service_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
-        await callback.answer("Нет доступа к разделу Сервис", show_alert=True)
-        return
-    await state.clear()
-    await safe_edit_or_send(
-        callback.message,
-        "🛠 <b>Сервис (Qhead Mobile)</b>\nВыберите нужный инструмент:",
-        reply_markup=service_menu_kb(callback.from_user.id),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data == "srv_imei")
-async def cb_srv_imei(callback: CallbackQuery, state: FSMContext) -> None:
-    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
-        return
-    await state.set_state(ServiceFSM.waiting_imei)
-    await safe_edit_or_send(
-        callback.message,
-        "📱 <b>Проверка IMEI / iCloud</b>\nОтправьте 15 цифр <b>IMEI</b> или <b>Серийный номер (SN)</b> Apple:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="service_menu")]]
-        ),
-    )
-    await callback.answer()
-
-
-@router.message(ServiceFSM.waiting_imei, F.text)
-async def msg_srv_imei(message: Message, state: FSMContext) -> None:
-    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
-        return
-    await state.clear()
-    res = await check_imei_info(message.text)
-    luhn_txt = ""
-    if res["luhn_valid"] is True:
-        luhn_txt = "✅ Контрольная сумма IMEI (Luhn) верна"
-    elif res["luhn_valid"] is False:
-        luhn_txt = "❌ Ошибка контрольной цифры IMEI — перепроверьте ввод"
-    lines = [
-        f"📱 <b>{h(res['kind'])}:</b> <code>{h(res['code'])}</code>",
-    ]
-    if luhn_txt:
-        lines.append(luhn_txt)
-    if res.get("api_data"):
-        hl = extract_imei_highlights(res["api_data"])
-        if hl:
-            lines.append(f"\n🔍 <b>Главное ({h(res['api_source'])}):</b>")
-            for k, v in hl.items():
-                lines.append(f"• <b>{h(k)}:</b> {h(v)}")
-        d = res["api_data"]
-        if isinstance(d, dict):
-            lines.append("\n📋 <b>Детали:</b>")
-            for k, v in list(d.items())[:10]:
-                lines.append(f"• <b>{h(str(k))}:</b> {h(str(v))}")
-        else:
-            lines.append(h(str(d)[:500]))
-    else:
-        lines.append(
-            "\n⚠️ <b>Авто-проверка iCloud ON/OFF и региона:</b> чтобы бот выводил статус iCloud и страну прямо сюда, "
-            "добавьте в переменные Bothost ключ <code>SICKW_API_KEY</code> или <code>IFREE_API_KEY</code> (без ключа базы Apple закрыты капчей)."
-            "\n\nПока можно проверить в 1 клик по кнопкам ниже:"
-        )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=lnk["name"], url=lnk["url"])] for lnk in res["links"]
-        ] + [
-            [InlineKeyboardButton(text="📱 Проверить другой IMEI", callback_data="srv_imei")],
-            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
-        ]
-    )
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-@router.callback_query(F.data == "srv_panic")
-async def cb_srv_panic(callback: CallbackQuery, state: FSMContext) -> None:
-    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
-        return
-    await state.set_state(ServiceFSM.waiting_panic)
-    await safe_edit_or_send(
-        callback.message,
-        "🩺 <b>Разбор Panic-логов iPhone</b>\nОтправьте файл <code>panic-full-*.ips</code> / <code>.txt</code> или вставьте текст лога:",
-        reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="service_menu")]]
-        ),
-    )
-    await callback.answer()
-
-
-async def _reply_panic_analysis(message: Message, raw_text: str) -> None:
-    res = analyze_panic_log(raw_text)
-    lines = [
-        "🩺 <b>Результат разбора Panic-лога</b>",
-        f"📱 <b>Модель:</b> {h(res['device_model'])}  |  <b>iOS:</b> {h(res['ios_build'])}",
-    ]
-    for idx, fnd in enumerate(res["findings"], 1):
-        lines.append(
-            f"\n<b>{idx}. {h(fnd['title'])}</b>\n"
-            f"• <i>Причина:</i> {h(fnd['cause'])}\n"
-            f"• <b>Что менять / проверить:</b> {h(fnd['fix'])}"
-        )
-    if res["panic_snippet"]:
-        lines.append(f"\n<code>{h(res['panic_snippet'][:300])}</code>")
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🩺 Разобрать ещё лог", callback_data="srv_panic")],
-            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
-        ]
-    )
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-@router.message(ServiceFSM.waiting_panic, F.document)
-async def msg_srv_panic_doc(message: Message, state: FSMContext, bot: Bot) -> None:
-    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
-        return
-    await state.clear()
-    buf = io.BytesIO()
-    await bot.download(message.document, destination=buf)
-    raw = buf.getvalue().decode("utf-8", errors="ignore")
-    await _reply_panic_analysis(message, raw)
-
-
-@router.message(ServiceFSM.waiting_panic, F.text)
-async def msg_srv_panic_text(message: Message, state: FSMContext) -> None:
-    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
-        return
-    await state.clear()
-    await _reply_panic_analysis(message, message.text)
-
-
-# --- Задачи в боте ---
-
-def tasks_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Новая задача", callback_data="task_new")],
-            [InlineKeyboardButton(text="📋 Активные задачи", callback_data="task_list:active")],
-            [InlineKeyboardButton(text="✅ Выполненные", callback_data="task_list:done")],
-            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
-        ]
-    )
-
-
-@router.callback_query(F.data == "tasks_menu")
-async def cb_tasks_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
-        return
-    await state.clear()
-    uh = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
-    cnt = len(get_tasks("active", uh))
-    await safe_edit_or_send(
-        callback.message,
-        f"📋 <b>Задачи и напоминания</b>\nАктивных задач: <b>{cnt}</b>",
-        reply_markup=tasks_menu_kb(),
-    )
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("task_list:"))
-async def cb_task_list(callback: CallbackQuery) -> None:
-    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
-        return
-    st = callback.data.split(":", 1)[1]
-    uh = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
-    items = get_tasks(st, uh)
-    rows = []
-    if not items:
-        txt = "📋 Список пуст."
-    else:
-        txt = f"📋 <b>{'Активные' if st == 'active' else 'Выполненные'} задачи:</b>"
-        for t in items[:15]:
-            ico = "📦" if t["task_type"] == "ship" else ("🤝" if t["task_type"] == "handover" else "🛒")
-            rows.append([InlineKeyboardButton(text=f"{ico} #{str(t['id']).zfill(3)} • {t['title'][:38]}", callback_data=f"task_view:{t['id']}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tasks_menu")])
-    await safe_edit_or_send(callback.message, txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("task_view:"))
-async def cb_task_view(callback: CallbackQuery) -> None:
-    t = get_task_by_id(int(callback.data.split(":")[1]))
-    if not t:
-        await callback.answer("Задача не найдена", show_alert=True)
-        return
-    rows = []
-    if t["status"] == "active":
-        rows.append([InlineKeyboardButton(text="✅ Задача выполнена", callback_data=f"task_done:{t['id']}")])
-    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"task_del:{t['id']}")])
-    rows.append([InlineKeyboardButton(text="⬅️ К задачам", callback_data="tasks_menu")])
-    await safe_edit_or_send(callback.message, format_task_html(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("task_done:"))
-async def cb_task_done(callback: CallbackQuery) -> None:
-    tid = int(callback.data.split(":")[1])
-    mark_task_done(tid)
-    await callback.answer("Задача выполнена! Напоминания остановлены.", show_alert=True)
-    if callback.message.text:
-        try:
-            await callback.message.edit_text(f"✅ <b>Задача #{str(tid).zfill(3)} выполнена!</b>", reply_markup=tasks_menu_kb())
-            return
-        except Exception:
-            pass
-    await callback.message.answer(f"✅ <b>Задача #{str(tid).zfill(3)} выполнена!</b>", reply_markup=tasks_menu_kb())
-
-
-@router.callback_query(F.data.startswith("task_del:"))
-async def cb_task_del(callback: CallbackQuery) -> None:
-    delete_task(int(callback.data.split(":")[1]))
-    await callback.answer("Удалено")
-    await cb_tasks_menu(callback, FSMContext) if False else await safe_edit_or_send(callback.message, "🗑 Задача удалена.", reply_markup=tasks_menu_kb())
-
-
-@router.callback_query(F.data == "task_new")
-async def cb_task_new(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Отправить товар клиенту", callback_data="task_type:ship")],
-            [InlineKeyboardButton(text="🤝 Передать товар клиенту", callback_data="task_type:handover")],
-            [InlineKeyboardButton(text="🛒 Купить запчасти", callback_data="task_type:buy")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
-        ]
-    )
-    await safe_edit_or_send(callback.message, "➕ <b>Выберите тип задачи:</b>", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("task_type:"))
-async def cb_task_type(callback: CallbackQuery, state: FSMContext) -> None:
-    ttype = callback.data.split(":", 1)[1]
-    await state.update_data(task_type=ttype, payload={}, photo_ref="", assignees=[])
-    if ttype == "ship":
-        await state.set_state(TaskFSM.waiting_ship_pickup)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Яндекс", callback_data="t_pick:Яндекс"), InlineKeyboardButton(text="СДЭК", callback_data="t_pick:СДЭК")],
-                [InlineKeyboardButton(text="Авито", callback_data="t_pick:Авито"), InlineKeyboardButton(text="Почта России", callback_data="t_pick:Почта России")],
-                [InlineKeyboardButton(text="5Post", callback_data="t_pick:5Post")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
-            ]
-        )
-        await safe_edit_or_send(callback.message, "📦 <b>Какой пункт выдачи / доставка?</b>\nВыберите или напишите свой вариант:", reply_markup=kb)
-    elif ttype == "handover":
-        await state.set_state(TaskFSM.waiting_hand_time)
-        await safe_edit_or_send(callback.message, "🤝 <b>В какое время будет клиент?</b> (напр. <code>16:30</code> или <code>до 19:00</code>):")
-    else:
-        await state.set_state(TaskFSM.waiting_buy_place)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Moba", callback_data="t_place:Moba"), InlineKeyboardButton(text="Master Mobile", callback_data="t_place:Master Mobile")],
-                [InlineKeyboardButton(text="MEMS", callback_data="t_place:MEMS")],
-                [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
-            ]
-        )
-        await safe_edit_or_send(callback.message, "🛒 <b>Где нужно купить запчасти?</b>\nВыберите или напишите место:", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(TaskFSM.waiting_ship_pickup, F.data.startswith("t_pick:"))
-async def cb_t_pick(callback: CallbackQuery, state: FSMContext) -> None:
-    val = callback.data.split(":", 1)[1]
-    await state.update_data(payload={"pickup": val})
-    await state.set_state(TaskFSM.waiting_ship_item)
-    await callback.message.answer(f"Пункт: <b>{h(val)}</b>\n\n📦 <b>Какой товар отправляем?</b>")
-    await callback.answer()
-
-
-@router.message(TaskFSM.waiting_ship_pickup, F.text)
-async def msg_t_pick(message: Message, state: FSMContext) -> None:
-    await state.update_data(payload={"pickup": message.text.strip()})
-    await state.set_state(TaskFSM.waiting_ship_item)
-    await message.answer("📦 <b>Какой товар отправляем?</b>")
-
-
-@router.message(TaskFSM.waiting_ship_item, F.text)
-async def msg_t_sitem(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    p = data["payload"]
-    p["item"] = message.text.strip()
-    await state.update_data(payload=p)
-    await state.set_state(TaskFSM.waiting_ship_loc)
-    await message.answer("📍 <b>Какая комплектация и где лежит?</b>")
-
-
-@router.message(TaskFSM.waiting_ship_loc, F.text)
-async def msg_t_sloc(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    p = data["payload"]
-    p["location"] = message.text.strip()
-    await state.update_data(payload=p)
-    await state.set_state(TaskFSM.waiting_ship_photo)
-    await message.answer("🖼 Отправьте <b>фото штрих-кода</b> отправки (или отправьте <code>-</code>, если без фото):")
-
-
-@router.message(TaskFSM.waiting_ship_photo, F.photo)
-async def msg_t_sphoto(message: Message, state: FSMContext) -> None:
-    await state.update_data(photo_ref=message.photo[-1].file_id)
-    await _ask_task_assignees(message, state)
-
-
-@router.message(TaskFSM.waiting_ship_photo, F.text)
-async def msg_t_sphoto_skip(message: Message, state: FSMContext) -> None:
-    await state.update_data(photo_ref="")
-    await _ask_task_assignees(message, state)
-
-
-@router.message(TaskFSM.waiting_hand_time, F.text)
-async def msg_t_htime(message: Message, state: FSMContext) -> None:
-    await state.update_data(payload={"time": message.text.strip()})
-    await state.set_state(TaskFSM.waiting_hand_item)
-    await message.answer("🤝 <b>Какой товар передаём клиенту?</b>")
-
-
-@router.message(TaskFSM.waiting_hand_item, F.text)
-async def msg_t_hitem(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    p = data["payload"]
-    p["item"] = message.text.strip()
-    await state.update_data(payload=p)
-    await state.set_state(TaskFSM.waiting_hand_loc)
-    await message.answer("📍 <b>Какая комплектация и где лежит?</b>")
-
-
-@router.message(TaskFSM.waiting_hand_loc, F.text)
-async def msg_t_hloc(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    p = data["payload"]
-    p["location"] = message.text.strip()
-    await state.update_data(payload=p)
-    await _ask_task_assignees(message, state)
-
-
-@router.callback_query(TaskFSM.waiting_buy_place, F.data.startswith("t_place:"))
-async def cb_t_place(callback: CallbackQuery, state: FSMContext) -> None:
-    val = callback.data.split(":", 1)[1]
-    await state.update_data(payload={"place": val, "items": []})
-    await state.set_state(TaskFSM.waiting_buy_item_name)
-    await callback.message.answer(f"Место: <b>{h(val)}</b>\n\n🛒 <b>Что нужно купить?</b> (название товара 1):")
-    await callback.answer()
-
-
-@router.message(TaskFSM.waiting_buy_place, F.text)
-async def msg_t_place(message: Message, state: FSMContext) -> None:
-    await state.update_data(payload={"place": message.text.strip(), "items": []})
-    await state.set_state(TaskFSM.waiting_buy_item_name)
-    await message.answer("🛒 <b>Что нужно купить?</b> (название товара 1):")
-
-
-@router.message(TaskFSM.waiting_buy_item_name, F.text)
-async def msg_t_bname(message: Message, state: FSMContext) -> None:
-    await state.update_data(cur_buy_name=message.text.strip())
-    await state.set_state(TaskFSM.waiting_buy_item_price)
-    await message.answer("💰 <b>Укажите цену для этой позиции (₽):</b>")
-
-
-@router.message(TaskFSM.waiting_buy_item_price, F.text)
-async def msg_t_bprice(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    p = data["payload"]
-    p.setdefault("items", []).append({"name": data["cur_buy_name"], "price": parse_amount(message.text)})
-    await state.update_data(payload=p)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="t_buy_more")],
-            [InlineKeyboardButton(text="➡️ Далее (кому задача)", callback_data="t_buy_done")],
-        ]
-    )
-    await message.answer(f"✅ Добавлено! Всего позиций: <b>{len(p['items'])}</b>", reply_markup=kb)
-
-
-@router.callback_query(F.data == "t_buy_more")
-async def cb_t_buy_more(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(TaskFSM.waiting_buy_item_name)
-    await callback.message.answer("🛒 <b>Название следующего товара:</b>")
-    await callback.answer()
-
-
-@router.callback_query(F.data == "t_buy_done")
-async def cb_t_buy_done(callback: CallbackQuery, state: FSMContext) -> None:
-    await _ask_task_assignees(callback.message, state)
-    await callback.answer()
-
-
-def _assignees_kb(selected: list[str]) -> InlineKeyboardMarkup:
-    rows = []
-    for p in get_assignable_people():
-        uh = p["user_hash"]
-        mark = "✅" if uh in selected else "☑️"
-        rows.append([InlineKeyboardButton(text=f"{mark} {p['label']}", callback_data=f"t_ass:{uh[:16]}")])
-    if selected:
-        rows.append([InlineKeyboardButton(text="➡️ Выбрать интервал", callback_data="t_ass_next")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def _ask_task_assignees(msg: Message, state: FSMContext) -> None:
-    await state.set_state(TaskFSM.waiting_assignees)
-    await msg.answer("👥 <b>Кому поставить задачу?</b> (можно выбрать 1 или несколько):", reply_markup=_assignees_kb([]))
-
-
-@router.callback_query(TaskFSM.waiting_assignees, F.data.startswith("t_ass:"))
-async def cb_t_ass(callback: CallbackQuery, state: FSMContext) -> None:
-    pref = callback.data.split(":", 1)[1]
-    data = await state.get_data()
-    sel = list(data.get("assignees") or [])
-    full = next((p["user_hash"] for p in get_assignable_people() if p["user_hash"].startswith(pref)), None)
-    if full:
-        if full in sel:
-            sel.remove(full)
-        else:
-            sel.append(full)
-        await state.update_data(assignees=sel)
-        await callback.message.edit_reply_markup(reply_markup=_assignees_kb(sel))
-    await callback.answer()
-
-
-@router.callback_query(TaskFSM.waiting_assignees, F.data == "t_ass_next")
-async def cb_t_ass_next(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(TaskFSM.waiting_interval)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="⏱ Каждые 30 минут", callback_data="t_iv:30")],
-            [InlineKeyboardButton(text="⏱ Каждый 1 час", callback_data="t_iv:60")],
-            [InlineKeyboardButton(text="⏱ Каждые 1,5 часа", callback_data="t_iv:90")],
-            [InlineKeyboardButton(text="⏱ Каждые 2 часа", callback_data="t_iv:120")],
-            [InlineKeyboardButton(text="🔔 Без повторов (1 раз)", callback_data="t_iv:0")],
-        ]
-    )
-    await callback.message.edit_text("⏱ <b>Как часто бот должен напоминать о задаче в чате?</b>", reply_markup=kb)
-    await callback.answer()
-
-
-@router.callback_query(TaskFSM.waiting_interval, F.data.startswith("t_iv:"))
-async def cb_t_iv(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
-    iv = int(callback.data.split(":", 1)[1])
-    data = await state.get_data()
-    ttype = data["task_type"]
-    p = data["payload"]
-    if ttype == "ship":
-        title = f"{p.get('pickup','')} • {p.get('item','')}"
-    elif ttype == "handover":
-        title = f"{p.get('time','')} • {p.get('item','')}"
-    else:
-        title = f"{p.get('place','')} ({len(p.get('items',[]))} поз.)"
-    tid = create_task(
-        task_type=ttype,
-        title=title,
-        payload=p,
-        assignees=data.get("assignees") or [],
-        interval_minutes=iv,
-        created_by=hash_user_id(callback.from_user.id),
-        photo_ref=data.get("photo_ref") or "",
-    )
-    await state.clear()
-    await send_task_notification(bot, tid, is_reminder=False)
-    await callback.message.edit_text(f"✅ <b>Задача #{str(tid).zfill(3)} создана и отправлена!</b>", reply_markup=tasks_menu_kb())
-    await callback.answer("Создано!")
 
 
 @router.callback_query(F.data == "parts_menu")
@@ -2451,7 +1689,7 @@ async def cb_parts_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(
         "🔍 <b>Поиск запчастей (Москва)</b>\n"
-        "Поиск по <b>Moba</b> + расчёт цены с вашей работой:",
+        "Поиск по <b>Master Mobile</b>, <b>Moba</b> и <b>MEMS</b> + расчёт цены с вашей работой:",
         reply_markup=parts_menu_kb(),
     )
     await callback.answer()
@@ -2490,72 +1728,47 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
     if not has_perm(message.from_user.id, "can_parts_search"):
         return
     query = message.text.strip()
-    wait_msg = await message.answer("⏳ Ищу запчасти на Moba...")
-    await state.clear()
+    wait_msg = await message.answer("⏳ Ищу запчасти на Master Mobile, Moba и MEMS...")
 
-    from urllib.parse import quote_plus
-    q_enc = quote_plus(query)
-    fallback_kb = InlineKeyboardMarkup(
+    res = await search_parts_all(query)
+    prices = [dict(r) for r in get_repair_prices()]
+    work_title, work_price = match_work_price(query, prices)
+
+    lines = [
+        f"🔍 Результаты по запросу: <b>{h(query)}</b> (<i>{h(res['normalized_query'])}</i>)",
+        f"🛠 Работа ({h(work_title)}): <b>{fmt_money(work_price)}</b>\n",
+    ]
+    for site_name, items in res["groups"].items():
+        lines.append(f"🏬 <b>{site_name}</b>")
+        if not items:
+            st = res.get("statuses", {}).get(site_name, 0)
+            note = f" (HTTP {st})" if st and st != 200 else ""
+            lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
+        else:
+            for it in items[:4]:
+                total = it["price"] + work_price
+                stock = "✅" if it["in_stock"] else "⏳"
+                lines.append(
+                    f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'])}</a>\n"
+                    f"   Качество: <b>{h(it['quality'])}</b>\n"
+                    f"   <sub>Запчасть: {fmt_money(it['price'])}</sub> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
+                )
+        lines.append("")
+
+    urls = res["search_urls"]
+    kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Открыть Moba", url=f"https://moba.ru/catalog/?q={q_enc}")],
+            [
+                InlineKeyboardButton(text="Master Mobile", url=urls["master_mobile"]),
+                InlineKeyboardButton(text="Moba", url=urls["moba"]),
+                InlineKeyboardButton(text="MEMS", url=urls["mems"]),
+            ],
             [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
         ]
     )
-
-    try:
-        res = await asyncio.wait_for(search_parts_all(query), timeout=8.0)
-        prices = [dict(r) for r in get_repair_prices()]
-        work_title, work_price = match_work_price(query, prices)
-
-        lines = [
-            f"🔍 Результаты по запросу: <b>{h(query)}</b> (<i>{h(res['normalized_query'])}</i>)",
-            f"🛠 Работа ({h(work_title)}): <b>{fmt_money(work_price)}</b>\n",
-        ]
-        for site_name, items in res["groups"].items():
-            lines.append(f"🏬 <b>{site_name}</b>")
-            if not items:
-                st = res.get("statuses", {}).get(site_name, 0)
-                note = f" (HTTP {st})" if st and st != 200 else ""
-                lines.append(f"<i>Карточки не найдены{note} — откройте поиск напрямую по кнопке ниже.</i>")
-            else:
-                for it in items[:4]:
-                    total = it["price"] + work_price
-                    stock = "✅" if it["in_stock"] else "⏳"
-                    lines.append(
-                        f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'][:85])}</a>\n"
-                        f"   Качество: <b>{h(it['quality'])}</b>\n"
-                        f"   <i>Запчасть: {fmt_money(it['price'])}</i> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
-                    )
-            lines.append("")
-
-        urls = res["search_urls"]
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="Открыть Moba", url=urls["moba"])],
-                [InlineKeyboardButton(text="🔍 Новый поиск", callback_data="rep_search")],
-                [InlineKeyboardButton(text="⬅️ Назад", callback_data="parts_menu")],
-            ]
-        )
-        txt = "\n".join(lines)
-        if len(txt) > 3900:
-            txt = txt[:3900] + "\n..."
-        try:
-            await wait_msg.edit_text(txt, reply_markup=kb, disable_web_page_preview=True)
-        except Exception:
-            await message.answer(txt, reply_markup=kb, disable_web_page_preview=True)
-    except Exception as e:
-        logger.exception(f"Bot parts search error for {query}: {e}")
-        try:
-            await wait_msg.edit_text(
-                f"⚠️ Не удалось загрузить карточки с Moba. Откройте поиск по запросу <b>{h(query)}</b> напрямую:",
-                reply_markup=fallback_kb,
-            )
-        except Exception:
-            await message.answer(
-                f"⚠️ Не удалось загрузить карточки с Moba. Откройте поиск напрямую:",
-                reply_markup=fallback_kb,
-            )
+    await state.clear()
+    await wait_msg.edit_text("\n".join(lines), reply_markup=kb, disable_web_page_preview=True)
 
 
 @router.callback_query(F.data == "rep_prices")
@@ -2659,58 +1872,21 @@ async def cb_rep_orders(callback: CallbackQuery) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     orders = get_repair_orders()
-    lines = ["📋 <b>Заказы СРМ Ремонт</b>\nНажмите на заказ, чтобы получить <b>Акт приёма</b> или <b>Акт выдачи</b>:\n"]
+    lines = ["📋 <b>Заказы СРМ Ремонт</b>\n"]
     rows = [[InlineKeyboardButton(text="➕ Принять устройство", callback_data="rep_new_order")]]
     if not orders:
         lines.append("<i>Заказов пока нет.</i>")
     else:
-        for o in orders[:15]:
-            st_ico = "✅" if o["status"] == "done" else "🛠"
+        for o in orders[:10]:
+            st = "✅ Выдан" if o["status"] == "done" else "🛠 В работе"
             num = str(o["id"]).zfill(4)
-            cname = o["client_name"] or o["client_info"] or "Клиент"
-            rows.append([
-                InlineKeyboardButton(
-                    text=f"{st_ico} №{num} • {o['device_model']} ({cname}) — {fmt_money(o['total_price'])}",
-                    callback_data=f"rep_view:{o['id']}",
-                )
-            ])
+            lines.append(f"• <b>№{num} {h(o['device_model'])}</b> ({h(o['client_name'] or o['client_info'])}) — {fmt_money(o['total_price'])} [{st}]")
+            if o["status"] == "in_work":
+                rows.append([InlineKeyboardButton(text=f"✅ Закрыть №{num} + Акт работ", callback_data=f"rep_done:{o['id']}")])
+            else:
+                rows.append([InlineKeyboardButton(text=f"📄 Акт работ №{num}", callback_data=f"rep_pdf_done:{o['id']}")])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_crm_menu")])
-    await safe_edit_or_send(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await callback.answer()
-
-
-@router.callback_query(F.data.startswith("rep_view:"))
-async def cb_rep_order_view(callback: CallbackQuery) -> None:
-    if not has_perm(callback.from_user.id, "can_repair_crm"):
-        return
-    oid = int(callback.data.split(":")[1])
-    o = get_repair_order_by_id(oid)
-    if not o:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    num = str(oid).zfill(4)
-    st = "✅ Выдан" if o["status"] == "done" else "🛠 В работе"
-    txt = (
-        f"📋 <b>Заказ №{num}</b> [{st}]\n\n"
-        f"📱 <b>Устройство:</b> {h(o['device_model'])}\n"
-        f"👤 <b>Клиент:</b> {h(o['client_name'] or o['client_info'] or '—')} ({h(o['client_phone'] or 'без тел.')})\n"
-        f"🔢 <b>IMEI / SN:</b> {h(o['imei_sn'] or '—')}\n"
-        f"🛠 <b>Неисправность:</b> {h(o['issue_desc'] or o['service_name'] or '—')}\n"
-        f"👀 <b>Внешний вид:</b> {h(o['appearance'] or '—')}\n"
-        f"💵 <b>Итого:</b> {fmt_money(o['total_price'])} (Предоплата: {fmt_money(o['prepayment'])})\n"
-        f"🛡 <b>Гарантия:</b> {int(o['warranty_days'] or 0)} дн."
-    )
-    rows = [
-        [
-            InlineKeyboardButton(text=f"📄 Акт приёма №{num}", callback_data=f"rep_pdf_intake:{oid}"),
-            InlineKeyboardButton(text=f"📄 Акт выдачи №{num}", callback_data=f"rep_pdf_done:{oid}"),
-        ]
-    ]
-    if o["status"] != "done":
-        rows.append([InlineKeyboardButton(text=f"✅ Закрыть ремонт + Акт выдачи", callback_data=f"rep_done:{oid}")])
-    rows.append([InlineKeyboardButton(text="🗑 Удалить заказ", callback_data=f"rep_del:{oid}")])
-    rows.append([InlineKeyboardButton(text="⬅️ К списку заказов", callback_data="rep_orders")])
-    await safe_edit_or_send(callback.message, txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -2719,8 +1895,7 @@ async def cb_rep_new_order(callback: CallbackQuery, state: FSMContext) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     await state.set_state(RepairFSM.waiting_order_client_name)
-    await safe_edit_or_send(
-        callback.message,
+    await callback.message.edit_text(
         "👤 Введите <b>Имя клиента</b>:",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="repair_crm_menu")]]
@@ -2786,42 +1961,25 @@ async def msg_rep_oimei(message: Message, state: FSMContext) -> None:
     await message.answer("🛠 Неисправность / что нужно сделать:")
 
 
-APPEARANCE_PRESETS_BOT = [
-    "Б/у, следы эксплуатации",
-    "Хорошее состояние",
-    "Сильные царапины по корпусу и дисплею",
-    "Сколы / вмятины на корпусе",
-    "Трещина стекла / дисплея",
-    "Следы влаги / не включается",
-]
-
 @router.message(RepairFSM.waiting_order_issue, F.text)
 async def msg_rep_oissue(message: Message, state: FSMContext) -> None:
     await state.update_data(issue_desc=message.text.strip())
     await state.set_state(RepairFSM.waiting_order_appearance)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=p, callback_data=f"rep_app:{i}")]
-            for i, p in enumerate(APPEARANCE_PRESETS_BOT)
-        ]
-    )
-    await message.answer("👀 Выберите внешний вид или напишите свой вариант:", reply_markup=kb)
-
-
-@router.callback_query(RepairFSM.waiting_order_appearance, F.data.startswith("rep_app:"))
-async def cb_rep_oapp(callback: CallbackQuery, state: FSMContext) -> None:
-    idx = int(callback.data.split(":", 1)[1])
-    val = APPEARANCE_PRESETS_BOT[idx] if 0 <= idx < len(APPEARANCE_PRESETS_BOT) else "Б/у, следы эксплуатации"
-    await state.update_data(appearance=val, completeness="")
-    await state.set_state(RepairFSM.waiting_order_passcode)
-    await callback.message.answer(f"👀 Внешний вид: <b>{h(val)}</b>\n\n🔐 Пароль от устройства / примечание (или <code>-</code>):")
-    await callback.answer()
+    await message.answer("👀 Внешний вид (например: <i>Потёртости, сколы</i> или <code>-</code>):")
 
 
 @router.message(RepairFSM.waiting_order_appearance, F.text)
 async def msg_rep_oapp(message: Message, state: FSMContext) -> None:
     val = "Б/у, следы эксплуатации" if message.text.strip() == "-" else message.text.strip()
-    await state.update_data(appearance=val, completeness="")
+    await state.update_data(appearance=val)
+    await state.set_state(RepairFSM.waiting_order_completeness)
+    await message.answer("📦 Комплектация (например: <i>Только устройство</i> или <code>-</code>):")
+
+
+@router.message(RepairFSM.waiting_order_completeness, F.text)
+async def msg_rep_ocomp(message: Message, state: FSMContext) -> None:
+    val = "Только устройство" if message.text.strip() == "-" else message.text.strip()
+    await state.update_data(completeness=val)
     await state.set_state(RepairFSM.waiting_order_passcode)
     await message.answer("🔐 Пароль от устройства / примечание (или <code>-</code>):")
 
@@ -2877,7 +2035,7 @@ async def _finalize_repair_order(target, state: FSMContext, warranty_days: int) 
         imei_sn=data["imei_sn"],
         issue_desc=data["issue_desc"],
         appearance=data["appearance"],
-        completeness=data.get("completeness", ""),
+        completeness=data["completeness"],
         passcode_note=data["passcode_note"],
         prepayment=data["prepayment"],
         warranty_days=warranty_days,
@@ -2929,52 +2087,13 @@ async def cb_rep_pdf_done(callback: CallbackQuery) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     oid = int(callback.data.split(":")[1])
-    row = get_repair_order_by_id(oid)
-    if not row:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    try:
-        pdf_bytes = generate_act_pdf(dict(row), "done")
-        num = str(oid).zfill(4)
-        await callback.message.answer_document(
-            BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
-        )
-        await callback.answer("Акт отправлен")
-    except Exception as e:
-        logger.exception(f"PDF generation error for order {oid}: {e}")
-        await callback.answer(f"Ошибка PDF: {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("rep_pdf_intake:"))
-async def cb_rep_pdf_intake(callback: CallbackQuery) -> None:
-    if not has_perm(callback.from_user.id, "can_repair_crm"):
-        return
-    oid = int(callback.data.split(":")[1])
-    row = get_repair_order_by_id(oid)
-    if not row:
-        await callback.answer("Заказ не найден", show_alert=True)
-        return
-    try:
-        pdf_bytes = generate_act_pdf(dict(row), "intake")
-        num = str(oid).zfill(4)
-        await callback.message.answer_document(
-            BufferedInputFile(pdf_bytes, filename=f"Akt_Priema_{num}.pdf"),
-            caption=f"📄 Акт приёма в ремонт №{num}",
-        )
-        await callback.answer("Акт приёма отправлен")
-    except Exception as e:
-        logger.exception(f"PDF intake error for order {oid}: {e}")
-        await callback.answer(f"Ошибка PDF: {e}", show_alert=True)
-
-
-@router.callback_query(F.data.startswith("rep_del:"))
-async def cb_rep_del(callback: CallbackQuery) -> None:
-    if not has_perm(callback.from_user.id, "can_repair_crm"):
-        return
-    oid = int(callback.data.split(":")[1])
-    delete_repair_order(oid)
-    await callback.answer("Заказ удалён")
-    await cb_rep_orders(callback)
+    order = dict(get_repair_order_by_id(oid))
+    pdf_bytes = generate_act_pdf(order, "done")
+    num = str(oid).zfill(4)
+    await callback.message.answer_document(
+        BufferedInputFile(pdf_bytes, filename=f"Akt_Vypolnennyh_Rabot_{num}.pdf"),
+    )
+    await callback.answer()
 
 
 # ===========================================================================
@@ -3986,8 +3105,7 @@ async def msg_delivery_cost(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "archive_list")
 async def cb_archive_list(callback: CallbackQuery) -> None:
-    uhash = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
-    archived = get_shipments("archived", uhash)
+    archived = get_shipments("archived")
     if not archived:
         await callback.message.edit_text(
             "Архив пуст.",
@@ -4037,7 +3155,6 @@ async def main() -> None:
     web_deps = {
         "get_crm_finances": get_crm_finances,
         "get_owner_hash": get_owner_hash,
-        "get_owner_tg_id": get_owner_tg_id,
         "find_admin_by_web_password": find_admin_by_web_password,
         "get_admin_by_hash": get_admin_by_hash,
         "get_setting": get_setting,
@@ -4053,25 +3170,13 @@ async def main() -> None:
         "delete_repair_order": delete_repair_order,
         "search_parts_all": search_parts_all,
         "match_work_price": match_work_price,
-        "check_imei_info": check_imei_info,
-        "analyze_panic_log": analyze_panic_log,
-        "get_assignable_people": get_assignable_people,
-        "create_task": create_task,
-        "get_tasks": get_tasks,
-        "mark_task_done": mark_task_done,
-        "delete_task": delete_task,
-        "send_task_notification": send_task_notification,
         "get_personal_stats_by_hash": get_personal_stats_by_hash,
         "get_personal_entries_by_hash": get_personal_entries_by_hash,
         "add_personal_entry_by_hash": add_personal_entry_by_hash,
         "mark_personal_sold_by_hash": mark_personal_sold_by_hash,
         "delete_personal_entry_by_hash": delete_personal_entry_by_hash,
         "get_shipments": get_shipments,
-        "create_shipment_by_hash": create_shipment_by_hash,
-        "can_access_shipment_by_hash": can_access_shipment_by_hash,
         "get_items": get_items,
-        "get_item": get_item,
-        "hash_user_id": hash_user_id,
         "get_setting": get_setting,
         "save_post": save_post,
         "get_all_posts": get_all_posts,
@@ -4092,11 +3197,9 @@ async def main() -> None:
         "build_sold_text_and_entities": build_sold_text_and_entities,
     }
     runner = await start_web_server(bot, web_deps)
-    rem_task = asyncio.create_task(_tasks_reminder_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
-        rem_task.cancel()
         await runner.cleanup()
 
 
