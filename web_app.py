@@ -615,12 +615,8 @@ async function api(url, method='GET', body=null) {
   const opts = { method, headers: {'Content-Type': 'application/json'} };
   if (body) opts.body = JSON.stringify(body);
   const res = await fetch(url, opts);
-  const raw = await res.text();
-  let data = {};
-  try { data = raw ? JSON.parse(raw) : {}; } catch (_) {
-    throw new Error(res.ok ? 'Ошибка ответа сервера' : ('HTTP ' + res.status));
-  }
-  if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || 'Ошибка запроса');
   return data;
 }
 
@@ -635,8 +631,7 @@ async function loadAll() {
 
 function render() {
   const isOwner = STATE.role === 'owner';
-  const hasPerms = STATE.perms && Object.keys(STATE.perms).length > 0;
-  const perms = hasPerms ? STATE.perms : { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
+  const perms = STATE.perms || { can_crm: isOwner, can_post: isOwner, can_personal_ledger: isOwner, can_parts_search: isOwner, can_repair_crm: isOwner };
   document.querySelectorAll('.dock-btn').forEach(b => {
     const t = b.dataset.tab;
     let show = true;
@@ -974,71 +969,26 @@ function compressImage(file, maxSide=700, quality=0.72) {
 }
 
 
-const ALL_BRANDS = Array.from(new Set(ALL_DEVICES.map(d => d.split(' ')[0]))).sort();
-const APP_PRESETS = [
-  'Б/у, следы эксплуатации',
-  'Хорошее состояние',
-  'Отличное состояние (как новый)',
-  'Мелкие царапины на дисплее',
-  'Потёртости и царапины по корпусу',
-  'Сильные царапины по корпусу и дисплею',
-  'Сколы / вмятины на корпусе',
-  'Трещина стекла / дисплея',
-  'Разбита задняя крышка',
-  'Следы влаги / коррозии',
-  'Не включается (проверка невозможна)'
-];
-
-function toggleAppPreset(val) {
-  const inp = document.getElementById('roApp');
-  let parts = inp.value.split(',').map(x => x.trim()).filter(Boolean);
-  if (parts.includes(val)) {
-    parts = parts.filter(x => x !== val);
-  } else {
-    parts.push(val);
-  }
-  inp.value = parts.join(', ');
-  document.querySelectorAll('.app-chip').forEach(ch => {
-    ch.style.borderColor = parts.includes(ch.dataset.val) ? '#ff5a1f' : 'rgba(255,255,255,.12)';
-    ch.style.background = parts.includes(ch.dataset.val) ? 'rgba(255,90,31,.22)' : 'rgba(255,255,255,.05)';
-  });
+function filterDev(q) {
+  const inp = document.getElementById('roDev');
+  inp.value = q + ' ';
+  inp.focus();
+  showDevSuggest();
 }
-
 function showDevSuggest() {
   const box = document.getElementById('devSuggest');
   const val = (document.getElementById('roDev').value || '').trim().toLowerCase();
   if (!val) { box.style.display = 'none'; return; }
-  const ruMap = {
-    'айфон':'iphone','самсунг':'samsung','сяоми':'xiaomi','редми':'redmi','поко':'poco',
-    'хонор':'honor','хуавей':'huawei','пиксель':'pixel','свитч':'switch','нинтендо':'nintendo',
-    'реалми':'realme','оппо':'oppo','ванплас':'oneplus','виво':'vivo','нокиа':'nokia',
-    'сони':'sony','моторола':'motorola','асус':'asus','мейзу':'meizu','текно':'tecno',
-    'инфиникс':'infinix','насинг':'nothing','про':'pro','макс':'max','мини':'mini','плюс':'plus','ультра':'ultra'
-  };
+  const ruMap = {'айфон':'iphone','самсунг':'samsung','сяоми':'xiaomi','редми':'redmi','поко':'poco','хонор':'honor','хуавей':'huawei','пиксель':'pixel','свитч':'switch','нинтендо':'nintendo','про':'pro','макс':'max','мини':'mini','плюс':'plus','ультра':'ultra'};
   let norm = val;
   for (const [k,v] of Object.entries(ruMap)) norm = norm.replace(new RegExp(k, 'g'), v);
   const toks = norm.split(/\s+/).filter(Boolean);
-
-  let html = '';
-  if (toks.length === 1) {
-    const brandMatches = ALL_BRANDS.filter(b => b.toLowerCase().includes(toks[0])).slice(0, 5);
-    html += brandMatches.map(b =>
-      `<div style="padding:8px 11px;font-size:13px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.06);color:#ff8a3d;font-weight:700" onclick="pickBrand('${esc(b)}')">Бренд: ${esc(b)} →</div>`
-    ).join('');
-  }
   const matches = ALL_DEVICES.filter(d => toks.every(t => d.toLowerCase().includes(t))).slice(0, 12);
-  html += matches.map(m =>
+  if (!matches.length) { box.style.display = 'none'; return; }
+  box.innerHTML = matches.map(m =>
     `<div style="padding:8px 11px;font-size:13px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,.06)" onclick="pickDev('${esc(m)}')">${esc(m)}</div>`
   ).join('');
-  if (!html) { box.style.display = 'none'; return; }
-  box.innerHTML = html;
   box.style.display = 'block';
-}
-function pickBrand(b) {
-  const inp = document.getElementById('roDev');
-  inp.value = b + ' ';
-  inp.focus();
-  showDevSuggest();
 }
 function pickDev(name) {
   document.getElementById('roDev').value = name;
@@ -1046,25 +996,26 @@ function pickDev(name) {
 }
 
 function openNewRepOrder(dev='', pcost=0, tot=0) {
-  const appChips = APP_PRESETS.map(p =>
-    `<button type="button" class="app-chip" data-val="${esc(p)}" onclick="toggleAppPreset('${esc(p)}')" style="padding:5px 9px;font-size:11px;border-radius:9px;border:1px solid ${p==='Б/у, следы эксплуатации'?'#ff5a1f':'rgba(255,255,255,.12)'};background:${p==='Б/у, следы эксплуатации'?'rgba(255,90,31,.22)':'rgba(255,255,255,.05)'};color:#f4f4f5;cursor:pointer;text-align:left">${esc(p)}</button>`
-  ).join('');
   openModal(`
     <h3>Принять устройство в ремонт</h3>
     <div class="field"><label>Имя клиента</label><input id="roCName" placeholder="Алексей"></div>
     <div class="field"><label>Телефон</label><input id="roCPhone" placeholder="+7 999 123-45-67"></div>
     <div class="field" style="position:relative">
-      <label>Бренд и модель (начните ввод — появятся подсказки)</label>
-      <input id="roDev" value="${esc(dev)}" placeholder="Напр. Samsung A55, 14 pro, Xiaomi..." oninput="showDevSuggest()" autocomplete="off">
-      <div id="devSuggest" style="display:none;max-height:170px;overflow-y:auto;background:#111116;border:1px solid rgba(255,90,31,.45);border-radius:10px;margin-top:4px"></div>
+      <label>Устройство / Модель (начните ввод для поиска)</label>
+      <div style="display:flex;gap:4px;flex-wrap:wrap;margin-bottom:6px">
+        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('iPhone')">Apple</button>
+        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Samsung')">Samsung</button>
+        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Xiaomi')">Xiaomi</button>
+        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('Nintendo')">Nintendo</button>
+        <button type="button" class="btn btn-dark btn-sm" onclick="filterDev('PlayStation')">PS</button>
+      </div>
+      <input id="roDev" value="${esc(dev)}" placeholder="Напр. 14 pro или Samsung A55..." oninput="showDevSuggest()" autocomplete="off">
+      <div id="devSuggest" style="display:none;max-height:160px;overflow-y:auto;background:#111116;border:1px solid rgba(255,90,31,.45);border-radius:10px;margin-top:4px"></div>
     </div>
     <div class="field"><label>IMEI / Серийный №</label><input id="roImei" placeholder="356789012345678"></div>
     <div class="field"><label>Неисправность</label><input id="roIssue" placeholder="Замена дисплея"></div>
-    <div class="field">
-      <label>Внешний вид (выберите или допишите)</label>
-      <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:7px">${appChips}</div>
-      <input id="roApp" value="Б/у, следы эксплуатации">
-    </div>
+    <div class="field"><label>Внешний вид</label><input id="roApp" value="Б/у, следы эксплуатации"></div>
+    <div class="field"><label>Комплектация</label><input id="roComp" value="Только устройство"></div>
     <div class="field"><label>Пароль / примечание</label><input id="roPass" placeholder="Код 1234"></div>
     <div class="field"><label>Себестоимость запчасти (₽)</label><input id="roPart" value="${pcost || ''}" placeholder="2100"></div>
     <div class="field"><label>Предоплата (₽)</label><input id="roPrep" value="0"></div>
@@ -1086,7 +1037,7 @@ async function submitNewRepOrder() {
     imei_sn: document.getElementById('roImei').value.trim(),
     issue_desc: document.getElementById('roIssue').value.trim(),
     appearance: document.getElementById('roApp').value.trim(),
-    completeness: '',
+    completeness: document.getElementById('roComp').value.trim(),
     passcode_note: document.getElementById('roPass').value.trim(),
     part_cost: document.getElementById('roPart').value.trim(),
     prepayment: document.getElementById('roPrep').value.trim(),
@@ -1409,9 +1360,8 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         all_ships = []
         unsold_my = []
         if perms["can_crm"]:
-            ship_filter_hash = None if is_owner else sess["user_hash"]
             for status in ("active", "archived"):
-                for s in deps["get_shipments"](status, ship_filter_hash):
+                for s in deps["get_shipments"](status):
                     sd = dict(s)
                     if not is_owner:
                         sd["delivery_cost"] = 0
@@ -1507,10 +1457,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         return web.json_response({"ok": True})
 
     # --- CRM Отправки ---
-    def _can_ship(request: web.Request, ship_id: int) -> bool:
-        sess = request["session"]
-        return deps["can_access_shipment_by_hash"](sess["user_hash"], sess["role"] == "owner", ship_id)
-
     async def handle_create_shipment(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
@@ -1518,14 +1464,12 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         name = str(body.get("name", "")).strip()
         if not name:
             return web.json_response({"error": "Введите название"}, status=400)
-        return web.json_response({"id": deps["create_shipment_by_hash"](request["session"]["user_hash"], name)})
+        return web.json_response({"id": deps["create_shipment"](0, name)})
 
     async def handle_arrive_shipment(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         ship_id = int(request.match_info["id"])
-        if not _can_ship(request, ship_id):
-            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         cost = deps["parse_amount"](str(body.get("delivery_cost", "0"))) if request["session"]["role"] == "owner" else 0.0
         deps["archive_shipment"](ship_id, cost)
@@ -1535,8 +1479,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         ship_id = int(request.match_info["id"])
-        if not _can_ship(request, ship_id):
-            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         iid = deps["create_item"](ship_id, str(body.get("name", "")), str(body.get("track_number", "")))
         if body.get("owner_type", "my") == "my":
@@ -1549,9 +1491,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
         item_id = int(request.match_info["id"])
-        item = deps["get_item"](item_id)
-        if not item or not _can_ship(request, int(item["shipment_id"])):
-            return web.json_response({"error": "Forbidden"}, status=403)
         body = await request.json()
         deps["update_item_name"](item_id, str(body.get("name", "")))
         deps["update_item_track"](item_id, str(body.get("track_number", "")))
@@ -1564,11 +1503,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     async def handle_delete_item(request: web.Request) -> web.Response:
         if not _has_perm(request, "can_crm"):
             return web.json_response({"error": "Forbidden"}, status=403)
-        item_id = int(request.match_info["id"])
-        item = deps["get_item"](item_id)
-        if not item or not _can_ship(request, int(item["shipment_id"])):
-            return web.json_response({"error": "Forbidden"}, status=403)
-        deps["delete_item"](item_id)
+        deps["delete_item"](int(request.match_info["id"]))
         return web.json_response({"ok": True})
 
     async def handle_sell_item(request: web.Request) -> web.Response:
