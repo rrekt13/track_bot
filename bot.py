@@ -12,7 +12,7 @@ from html import escape as h
 from acts import generate_act_pdf
 from devices_catalog import search_devices
 from repair import match_work_price, search_parts_all
-from service_tools import analyze_panic_log, check_imei_info
+from service_tools import analyze_panic_log, check_imei_info, extract_imei_highlights
 from typing import Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -1792,15 +1792,24 @@ async def msg_srv_imei(message: Message, state: FSMContext) -> None:
     if luhn_txt:
         lines.append(luhn_txt)
     if res.get("api_data"):
-        lines.append(f"\n🔍 <b>Ответ {h(res['api_source'])}:</b>")
+        hl = extract_imei_highlights(res["api_data"])
+        if hl:
+            lines.append(f"\n🔍 <b>Главное ({h(res['api_source'])}):</b>")
+            for k, v in hl.items():
+                lines.append(f"• <b>{h(k)}:</b> {h(v)}")
         d = res["api_data"]
         if isinstance(d, dict):
+            lines.append("\n📋 <b>Детали:</b>")
             for k, v in list(d.items())[:10]:
                 lines.append(f"• <b>{h(str(k))}:</b> {h(str(v))}")
         else:
             lines.append(h(str(d)[:500]))
     else:
-        lines.append("\nОткройте мгновенную проверку FMI / iCloud по кнопкам ниже (код уже скопирован выше):")
+        lines.append(
+            "\n⚠️ <b>Авто-проверка iCloud ON/OFF и региона:</b> чтобы бот выводил статус iCloud и страну прямо сюда, "
+            "добавьте в переменные Bothost ключ <code>SICKW_API_KEY</code> или <code>IFREE_API_KEY</code> (без ключа базы Apple закрыты капчей)."
+            "\n\nПока можно проверить в 1 клик по кнопкам ниже:"
+        )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=lnk["name"], url=lnk["url"])] for lnk in res["links"]

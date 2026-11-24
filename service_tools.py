@@ -198,12 +198,14 @@ async def check_imei_info(raw_code: str) -> dict[str, Any]:
     }
 
     if not (is_imei or is_sn):
-        return result
+        result["highlights"] = extract_imei_highlights(result["api_data"]) if result["api_data"] else {}
+    return result
 
     # Если подключён ключ API (SICKW_API_KEY или IFREE_API_KEY) — запрашиваем автоматически
     if SICKW_API_KEY:
         try:
-            url = f"https://sickw.com/api.php?format=json&key={SICKW_API_KEY}&imei={code}&service=demo"
+            svc = os.getenv("SICKW_SERVICE_ID", "demo").strip() or "demo"
+            url = f"https://sickw.com/api.php?format=json&key={SICKW_API_KEY}&imei={code}&service={svc}"
             timeout = aiohttp.ClientTimeout(total=8)
             async with aiohttp.ClientSession() as sess:
                 async with sess.get(url, timeout=timeout) as resp:
@@ -303,3 +305,42 @@ def analyze_panic_log(raw_text: str) -> dict[str, Any]:
         "panic_snippet": panic_str.strip()[:380],
         "findings": findings[:4],
     }
+
+
+def extract_imei_highlights(api_data: Any) -> dict[str, str]:
+    """Достаёт самые важные поля (iCloud FMI, Регион, Модель, Sim-Lock, Blacklist) из ответа API."""
+    out: dict[str, str] = {}
+    if not isinstance(api_data, dict):
+        return out
+    flat: dict[str, str] = {}
+    for k, v in api_data.items():
+        if isinstance(v, dict):
+            for sk, sv in v.items():
+                flat[sk.lower()] = str(sv)
+        else:
+            flat[k.lower()] = str(v)
+
+    def _pick(keys: list[str]) -> str:
+        for kw in keys:
+            for fk, fv in flat.items():
+                if kw in fk and fv and fv.lower() not in ("none", "null", ""):
+                    return fv
+        return ""
+
+    fmi = _pick(["find my", "fmi", "icloud"])
+    region = _pick(["country", "region", "purchase", "sold", "регион"])
+    model = _pick(["model", "device", "product"])
+    simlock = _pick(["sim-lock", "simlock", "carrier", "locked"])
+    blacklist = _pick(["blacklist", "lost", "gsma"])
+
+    if fmi:
+        out["iCloud (Find My)"] = fmi
+    if region:
+        out["Регион / Страна"] = region
+    if model:
+        out["Модель"] = model
+    if simlock:
+        out["Sim-Lock / Оператор"] = simlock
+    if blacklist:
+        out["Blacklist / Lost"] = blacklist
+    return out

@@ -643,11 +643,25 @@ async function runImeiCheck() {
     const res = await api('/api/service/imei', 'POST', { code });
     const luhnBadge = res.luhn_valid === true ? '<span class="badge badge-sold">Luhn OK</span>'
       : (res.luhn_valid === false ? '<span class="badge" style="background:var(--red-soft);color:var(--red)">Ошибка цифры IMEI</span>' : '');
+    let hlHtml = '';
+    const hl = res.highlights || {};
+    if (Object.keys(hl).length) {
+      hlHtml = '<div class="kpi-grid" style="margin-top:10px">' + Object.entries(hl).map(([k,v]) => {
+        const isFmiOn = k.includes('iCloud') && /on|вкл/i.test(String(v));
+        const isFmiOff = k.includes('iCloud') && /off|выкл/i.test(String(v));
+        const cls = isFmiOn ? 'orange' : (isFmiOff ? 'green' : '');
+        return `<div class="kpi" style="padding:9px 11px"><div class="kpi-label">${esc(k)}</div><div class="kpi-val ${cls}" style="font-size:14px">${esc(v)}</div></div>`;
+      }).join('') + '</div>';
+    }
     let apiHtml = '';
     if (res.api_data && typeof res.api_data === 'object') {
-      apiHtml = '<div style="margin-top:10px">' + Object.entries(res.api_data).slice(0,10).map(([k,v]) =>
-        `<div style="font-size:12px;margin:3px 0"><b>${esc(k)}:</b> ${esc(v)}</div>`
+      apiHtml = '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">' + Object.entries(res.api_data).slice(0,10).map(([k,v]) =>
+        `<div style="font-size:12px;margin:3px 0;color:#d4d4d8"><b>${esc(k)}:</b> ${esc(v)}</div>`
       ).join('') + '</div>';
+    } else {
+      apiHtml = `<div style="margin-top:10px;padding:9px 11px;border-radius:10px;background:rgba(255,90,31,.1);border:1px solid rgba(255,90,31,.3);font-size:12px;color:#fdba74">
+        Для авто-вывода <b>iCloud ON/OFF</b> и <b>Региона</b> добавьте <code>SICKW_API_KEY</code> или <code>IFREE_API_KEY</code> в переменные Bothost. Пока можно открыть проверку в 1 клик ниже:
+      </div>`;
     }
     const linksHtml = (res.links || []).map(l =>
       `<a href="${esc(l.url)}" target="_blank" class="btn btn-dark btn-sm">${esc(l.name)} ↗</a>`
@@ -658,6 +672,7 @@ async function runImeiCheck() {
           <div><b>${esc(res.kind)}:</b> <span class="track-pill" onclick="copyText('${esc(res.code)}')">${esc(res.code)}</span></div>
           ${luhnBadge}
         </div>
+        ${hlHtml}
         ${apiHtml}
         <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px">${linksHtml}</div>
       </div>`;
