@@ -477,9 +477,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </section>
 
     <section id="view-service" style="display:none">
-      <div style="display:flex;gap:8px;margin-bottom:14px;background:var(--card);border:1px solid var(--border);padding:5px;border-radius:14px">
-        <button id="srvBtnRepair" type="button" class="btn btn-orange" style="flex:1;justify-content:center" onclick="switchServiceSub('repair')">СРМ Ремонт</button>
-        <button id="srvBtnParts" type="button" class="btn btn-dark" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('parts')">Запчасти (Moba)</button>
+      <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px;background:var(--card);border:1px solid var(--border);padding:5px;border-radius:14px">
+        <button id="srvBtnRepair" type="button" class="btn btn-orange btn-sm" style="flex:1;justify-content:center" onclick="switchServiceSub('repair')">СРМ Ремонт</button>
+        <button id="srvBtnParts" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('parts')">Запчасти</button>
+        <button id="srvBtnImei" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('imei')">IMEI / iCloud</button>
+        <button id="srvBtnPanic" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('panic')">Panic-логи</button>
       </div>
       <div id="view-repair">
         <div class="toolbar">
@@ -499,6 +501,21 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button class="btn btn-dark btn-sm" onclick="openNewRepPrice()">+ Услуга</button>
         </div>
         <div id="repPricesList" class="kpi-grid"></div>
+      </div>
+      <div id="view-imei" style="display:none">
+        <div class="toolbar">
+          <input class="search" id="imeiInput" placeholder="Введите 15 цифр IMEI или SN Apple..." onkeydown="if(event.key==='Enter') runImeiCheck()">
+          <button class="btn btn-orange" onclick="runImeiCheck()">Проверить</button>
+        </div>
+        <div id="imeiResult"></div>
+      </div>
+      <div id="view-panic" style="display:none">
+        <div class="ship-card" style="padding:14px;margin-bottom:12px">
+          <div class="field"><label>Загрузить файл (.ips / .txt / .log)</label><input type="file" id="panicFile" accept=".ips,.txt,.log,.panic,application/json,text/plain" onchange="readPanicFile(this)"></div>
+          <div class="field"><label>Или вставьте текст panic-лога</label><textarea id="panicText" rows="5" placeholder="Вставьте содержимое panic-full..."></textarea></div>
+          <button class="btn btn-orange" onclick="runPanicCheck()">Разобрать Panic-лог</button>
+        </div>
+        <div id="panicResult"></div>
       </div>
     </section>
 
@@ -606,20 +623,80 @@ function copyText(txt) {
 }
 function switchServiceSub(sub) {
   SERVICE_SUB = sub;
-  const rEl = document.getElementById('view-repair');
-  const pEl = document.getElementById('view-parts');
-  const br = document.getElementById('srvBtnRepair');
-  const bp = document.getElementById('srvBtnParts');
-  if (rEl && pEl) {
-    rEl.style.display = (sub === 'repair') ? '' : 'none';
-    pEl.style.display = (sub === 'parts') ? '' : 'none';
-  }
-  if (br && bp) {
-    br.className = sub === 'repair' ? 'btn btn-orange' : 'btn btn-dark';
-    bp.className = sub === 'parts' ? 'btn btn-orange' : 'btn btn-dark';
+  const map = { repair: ['view-repair','srvBtnRepair'], parts: ['view-parts','srvBtnParts'], imei: ['view-imei','srvBtnImei'], panic: ['view-panic','srvBtnPanic'] };
+  for (const [k, [vId, bId]] of Object.entries(map)) {
+    const v = document.getElementById(vId);
+    const b = document.getElementById(bId);
+    if (v) v.style.display = (k === sub) ? '' : 'none';
+    if (b) b.className = (k === sub) ? 'btn btn-orange btn-sm' : 'btn btn-dark btn-sm';
   }
   if (sub === 'repair') renderRepairCRM();
   if (sub === 'parts') renderParts();
+}
+
+async function runImeiCheck() {
+  const code = document.getElementById('imeiInput').value.trim();
+  if (!code) { toast('Введите IMEI или SN'); return; }
+  const out = document.getElementById('imeiResult');
+  out.innerHTML = '<div class="empty">Проверяю...</div>';
+  try {
+    const res = await api('/api/service/imei', 'POST', { code });
+    const luhnBadge = res.luhn_valid === true ? '<span class="badge badge-sold">Luhn OK</span>'
+      : (res.luhn_valid === false ? '<span class="badge" style="background:var(--red-soft);color:var(--red)">Ошибка цифры IMEI</span>' : '');
+    let apiHtml = '';
+    if (res.api_data && typeof res.api_data === 'object') {
+      apiHtml = '<div style="margin-top:10px">' + Object.entries(res.api_data).slice(0,10).map(([k,v]) =>
+        `<div style="font-size:12px;margin:3px 0"><b>${esc(k)}:</b> ${esc(v)}</div>`
+      ).join('') + '</div>';
+    }
+    const linksHtml = (res.links || []).map(l =>
+      `<a href="${esc(l.url)}" target="_blank" class="btn btn-dark btn-sm">${esc(l.name)} ↗</a>`
+    ).join('');
+    out.innerHTML = `
+      <div class="ship-card" style="padding:14px">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:8px">
+          <div><b>${esc(res.kind)}:</b> <span class="track-pill" onclick="copyText('${esc(res.code)}')">${esc(res.code)}</span></div>
+          ${luhnBadge}
+        </div>
+        ${apiHtml}
+        <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:12px">${linksHtml}</div>
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
+}
+
+function readPanicFile(inp) {
+  const f = inp.files[0];
+  if (!f) return;
+  const r = new FileReader();
+  r.onload = (e) => { document.getElementById('panicText').value = e.target.result || ''; runPanicCheck(); };
+  r.readAsText(f);
+}
+
+async function runPanicCheck() {
+  const text = document.getElementById('panicText').value.trim();
+  if (!text) { toast('Загрузите файл или вставьте текст лога'); return; }
+  const out = document.getElementById('panicResult');
+  out.innerHTML = '<div class="empty">Анализирую лог...</div>';
+  try {
+    const res = await api('/api/service/panic', 'POST', { text });
+    const cards = (res.findings || []).map((f, i) => `
+      <div class="micro-card" style="flex-direction:column;align-items:flex-start;gap:4px">
+        <div style="font-weight:700;color:#ff8a3d">${i+1}. ${esc(f.title)}</div>
+        <div style="font-size:12px;color:#d4d4d8"><b>Причина:</b> ${esc(f.cause)}</div>
+        <div style="font-size:12px;color:#86efac"><b>Что менять / проверить:</b> ${esc(f.fix)}</div>
+      </div>
+    `).join('');
+    out.innerHTML = `
+      <div class="ship-card" style="padding:14px">
+        <div style="font-weight:700;margin-bottom:8px">📱 ${esc(res.device_model)} • iOS ${esc(res.ios_build)}</div>
+        ${cards}
+        ${res.panic_snippet ? `<pre style="margin-top:10px;padding:10px;background:#0a0a0f;border-radius:10px;font-size:11px;color:#a1a1aa;white-space:pre-wrap;word-break:break-word">${esc(res.panic_snippet)}</pre>` : ''}
+      </div>`;
+  } catch (e) {
+    out.innerHTML = `<div class="empty">${esc(e.message)}</div>`;
+  }
 }
 
 function switchTab(tab) {
@@ -1777,7 +1854,21 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/api/direct/{id}/sell", handle_sell_direct)
     app.router.add_delete("/api/direct/{id}", handle_delete_direct)
     app.router.add_get("/api/photo/{name}", handle_get_photo)
+    async def handle_srv_imei(request: web.Request) -> web.Response:
+        if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        body = await request.json()
+        return web.json_response(await deps["check_imei_info"](str(body.get("code", ""))))
+
+    async def handle_srv_panic(request: web.Request) -> web.Response:
+        if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        body = await request.json()
+        return web.json_response(deps["analyze_panic_log"](str(body.get("text", ""))))
+
     app.router.add_get("/api/repair/search", handle_repair_search)
+    app.router.add_post("/api/service/imei", handle_srv_imei)
+    app.router.add_post("/api/service/panic", handle_srv_panic)
     app.router.add_post("/api/repair/prices", handle_add_rep_price)
     app.router.add_put("/api/repair/prices/{id}", handle_upd_rep_price)
     app.router.add_delete("/api/repair/prices/{id}", handle_del_rep_price)

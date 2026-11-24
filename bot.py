@@ -12,6 +12,7 @@ from html import escape as h
 from acts import generate_act_pdf
 from devices_catalog import search_devices
 from repair import match_work_price, search_parts_all
+from service_tools import analyze_panic_log, check_imei_info
 from typing import Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
@@ -1084,6 +1085,11 @@ class PostFSM(StatesGroup):
     waiting_post_sold_price = State()
 
 
+class ServiceFSM(StatesGroup):
+    waiting_imei = State()
+    waiting_panic = State()
+
+
 class RepairFSM(StatesGroup):
     waiting_search_query = State()
     waiting_new_price_title = State()
@@ -1713,6 +1719,9 @@ def service_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
     if has_perm(user_id, "can_parts_search"):
         rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
+    if has_perm(user_id, "can_parts_search") or has_perm(user_id, "can_repair_crm"):
+        rows.append([InlineKeyboardButton(text="📱 Проверка IMEI / iCloud", callback_data="srv_imei")])
+        rows.append([InlineKeyboardButton(text="🩺 Разбор Panic-логов", callback_data="srv_panic")])
     rows.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1749,6 +1758,115 @@ async def cb_service_menu(callback: CallbackQuery, state: FSMContext) -> None:
         reply_markup=service_menu_kb(callback.from_user.id),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "srv_imei")
+async def cb_srv_imei(callback: CallbackQuery, state: FSMContext) -> None:
+    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
+        return
+    await state.set_state(ServiceFSM.waiting_imei)
+    await safe_edit_or_send(
+        callback.message,
+        "📱 <b>Проверка IMEI / iCloud</b>\nОтправьте 15 цифр <b>IMEI</b> или <b>Серийный номер (SN)</b> Apple:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="service_menu")]]
+        ),
+    )
+    await callback.answer()
+
+
+@router.message(ServiceFSM.waiting_imei, F.text)
+async def msg_srv_imei(message: Message, state: FSMContext) -> None:
+    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
+        return
+    await state.clear()
+    res = await check_imei_info(message.text)
+    luhn_txt = ""
+    if res["luhn_valid"] is True:
+        luhn_txt = "✅ Контрольная сумма IMEI (Luhn) верна"
+    elif res["luhn_valid"] is False:
+        luhn_txt = "❌ Ошибка контрольной цифры IMEI — перепроверьте ввод"
+    lines = [
+        f"📱 <b>{h(res['kind'])}:</b> <code>{h(res['code'])}</code>",
+    ]
+    if luhn_txt:
+        lines.append(luhn_txt)
+    if res.get("api_data"):
+        lines.append(f"\n🔍 <b>Ответ {h(res['api_source'])}:</b>")
+        d = res["api_data"]
+        if isinstance(d, dict):
+            for k, v in list(d.items())[:10]:
+                lines.append(f"• <b>{h(str(k))}:</b> {h(str(v))}")
+        else:
+            lines.append(h(str(d)[:500]))
+    else:
+        lines.append("\nОткройте мгновенную проверку FMI / iCloud по кнопкам ниже (код уже скопирован выше):")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=lnk["name"], url=lnk["url"])] for lnk in res["links"]
+        ] + [
+            [InlineKeyboardButton(text="📱 Проверить другой IMEI", callback_data="srv_imei")],
+            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
+        ]
+    )
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.callback_query(F.data == "srv_panic")
+async def cb_srv_panic(callback: CallbackQuery, state: FSMContext) -> None:
+    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
+        return
+    await state.set_state(ServiceFSM.waiting_panic)
+    await safe_edit_or_send(
+        callback.message,
+        "🩺 <b>Разбор Panic-логов iPhone</b>\nОтправьте файл <code>panic-full-*.ips</code> / <code>.txt</code> или вставьте текст лога:",
+        reply_markup=InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="service_menu")]]
+        ),
+    )
+    await callback.answer()
+
+
+async def _reply_panic_analysis(message: Message, raw_text: str) -> None:
+    res = analyze_panic_log(raw_text)
+    lines = [
+        "🩺 <b>Результат разбора Panic-лога</b>",
+        f"📱 <b>Модель:</b> {h(res['device_model'])}  |  <b>iOS:</b> {h(res['ios_build'])}",
+    ]
+    for idx, fnd in enumerate(res["findings"], 1):
+        lines.append(
+            f"\n<b>{idx}. {h(fnd['title'])}</b>\n"
+            f"• <i>Причина:</i> {h(fnd['cause'])}\n"
+            f"• <b>Что менять / проверить:</b> {h(fnd['fix'])}"
+        )
+    if res["panic_snippet"]:
+        lines.append(f"\n<code>{h(res['panic_snippet'][:300])}</code>")
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🩺 Разобрать ещё лог", callback_data="srv_panic")],
+            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
+        ]
+    )
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@router.message(ServiceFSM.waiting_panic, F.document)
+async def msg_srv_panic_doc(message: Message, state: FSMContext, bot: Bot) -> None:
+    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
+        return
+    await state.clear()
+    buf = io.BytesIO()
+    await bot.download(message.document, destination=buf)
+    raw = buf.getvalue().decode("utf-8", errors="ignore")
+    await _reply_panic_analysis(message, raw)
+
+
+@router.message(ServiceFSM.waiting_panic, F.text)
+async def msg_srv_panic_text(message: Message, state: FSMContext) -> None:
+    if not (has_perm(message.from_user.id, "can_parts_search") or has_perm(message.from_user.id, "can_repair_crm")):
+        return
+    await state.clear()
+    await _reply_panic_analysis(message, message.text)
 
 
 @router.callback_query(F.data == "parts_menu")
@@ -3361,6 +3479,8 @@ async def main() -> None:
         "delete_repair_order": delete_repair_order,
         "search_parts_all": search_parts_all,
         "match_work_price": match_work_price,
+        "check_imei_info": check_imei_info,
+        "analyze_panic_log": analyze_panic_log,
         "get_personal_stats_by_hash": get_personal_stats_by_hash,
         "get_personal_entries_by_hash": get_personal_entries_by_hash,
         "add_personal_entry_by_hash": add_personal_entry_by_hash,
