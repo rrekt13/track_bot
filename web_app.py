@@ -921,7 +921,7 @@ function renderRepairCRM() {
       ? `<span class="badge badge-sold">Выдан • +${fmtMoney((o.total_price||0)-(o.part_cost||0))}</span>`
       : `<span class="badge badge-active">В работе</span>`;
     const actDoneBtn = o.status === 'done'
-      ? `<button type="button" class="btn btn-green btn-sm" onclick="downloadAct(${o.id}, 'done')">Акт работ (PDF)</button>`
+      ? `<button type="button" class="btn btn-green btn-sm" onclick="showBotActHint(${o.id}, 'done')">Акт работ (PDF)</button>`
       : `<button class="btn btn-green btn-sm" onclick="markRepDone(${o.id})">Завершить + Акт</button>`;
     return `
       <div class="post-card">
@@ -935,7 +935,7 @@ function renderRepairCRM() {
           <div style="margin-top:8px">${stBadge}</div>
         </div>
         <div class="post-foot">
-          <button type="button" class="btn btn-dark btn-sm" onclick="downloadAct(${o.id}, 'intake')">Акт приёма</button>
+          <button type="button" class="btn btn-dark btn-sm" onclick="showBotActHint(${o.id}, 'intake')">Акт приёма</button>
           ${actDoneBtn}
           <button class="btn btn-red btn-sm" onclick="delRepOrder(${o.id})">Удал.</button>
         </div>
@@ -1077,31 +1077,27 @@ function openNewRepOrder(dev='', pcost=0, tot=0) {
     </div>
   `);
 }
-async function downloadAct(id, actType) {
-  try {
-    const tgId = window.Telegram?.WebApp?.initDataUnsafe?.user?.id || 0;
-    try {
-      await api('/api/repair/orders/' + id + '/act/' + actType + '/send', 'POST', { tg_id: tgId });
-      toast('PDF-акт отправлен вам в чат с ботом!');
-      return;
-    } catch (_) {}
-    const num = String(id).padStart(4, '0');
-    const fname = (actType === 'intake' ? 'Akt_Priema_' : 'Akt_Rabot_') + num + '.pdf';
-    const res = await fetch('/api/repair/orders/' + id + '/act/' + actType + '.pdf');
-    if (!res.ok) throw new Error('Ошибка скачивания акта (' + res.status + ')');
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = fname;
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 4000);
-    toast('Акт скачивается...');
-  } catch (e) {
-    toast(e.message || 'Не удалось скачать акт');
-  }
+function showBotActHint(id, actType) {
+  const o = (STATE.repair_orders || []).find(x => x.id === id);
+  const num = String(id).padStart(4, '0');
+  const dev = o ? `${o.device_model} (${o.client_name || o.client_info || 'Клиент'})` : `Заказ №${num}`;
+  const docName = actType === 'intake' ? 'Акт приёма в ремонт' : 'Акт выполненных работ (выдачи)';
+  const btnName = actType === 'intake' ? `📄 Акт приёма №${num}` : `📄 Акт выдачи №${num}`;
+  openModal(`
+    <h3>Получить PDF-акт в боте</h3>
+    <div style="background:rgba(255,90,31,.12);border:1px solid rgba(255,90,31,.4);border-radius:12px;padding:12px;margin-bottom:12px">
+      <div style="font-size:12px;color:#fdba74;font-weight:700;margin-bottom:4px">${esc(docName)}</div>
+      <div style="font-size:14px;font-weight:700">№${num} • ${esc(dev)}</div>
+    </div>
+    <p style="font-size:13px;color:#d4d4d8;line-height:1.5;margin:0 0 12px">
+      Чтобы не нагружать веб-интерфейс и не ловить сбои Safari, выдача PDF перенесена в Telegram-бота.<br><br>
+      <b>Закройте Веб-QCRM</b> и откройте в боте:<br>
+      <b>🛠 Сервис → 🛠 СРМ Ремонт → 📋 Заказы и акты → №${num} → ${esc(btnName)}</b>
+    </p>
+    <div class="modal-btns">
+      <button class="btn btn-orange" onclick="closeModal()">Понятно</button>
+    </div>
+  `);
 }
 
 async function submitNewRepOrder() {
@@ -1123,13 +1119,13 @@ async function submitNewRepOrder() {
   });
   closeModal(); toast('Заказ принят!');
   await loadAll();
-  await downloadAct(res.id, 'intake');
+  showBotActHint(res.id, 'intake');
 }
 async function markRepDone(id) {
   await api('/api/repair/orders/' + id + '/done', 'POST');
   toast('Ремонт завершён!');
   await loadAll();
-  await downloadAct(id, 'done');
+  showBotActHint(id, 'done');
 }
 async function delRepOrder(id) {
   if (!confirm('Удалить заказ?')) return;
@@ -1361,7 +1357,7 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
     @web.middleware
     async def auth_mw(request: web.Request, handler):
-        if request.path in ("/login", "/logout", "/health") or (request.path.startswith("/api/repair/orders/") and request.path.endswith(".pdf") and request.query.get("t")):
+        if request.path in ("/login", "/logout", "/health"):
             return await handler(request)
         cookie = request.cookies.get(COOKIE_NAME, "")
         sess = _verify_cookie(cookie, _secret())
@@ -1733,67 +1729,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
         deps["delete_repair_order"](int(request.match_info["id"]))
         return web.json_response({"ok": True})
 
-    def _make_act_token(oid: int, act_type: str) -> str:
-        exp = int(time.time()) + 3600
-        sig = _sign_payload(f"act:{oid}:{act_type}:{exp}", _secret())
-        return f"{exp}.{sig}"
-
-    def _verify_act_token(token: str, oid: int, act_type: str) -> bool:
-        try:
-            exp_s, sig = token.split(".", 1)
-            if int(exp_s) < int(time.time()):
-                return False
-            expected = _sign_payload(f"act:{oid}:{act_type}:{exp_s}", _secret())
-            return hmac.compare_digest(sig, expected)
-        except Exception:
-            return False
-
-    async def handle_get_act_pdf(request: web.Request) -> web.Response:
-        oid = int(request.match_info["id"])
-        act_type = request.match_info["act_type"]
-        tok = request.query.get("t", "")
-        if not _verify_act_token(tok, oid, act_type):
-            if not request.get("session") or not _has_perm(request, "can_repair_crm"):
-                return web.json_response({"error": "Unauthorized"}, status=401)
-        oid = int(request.match_info["id"])
-        act_type = request.match_info["act_type"]
-        if act_type not in ("intake", "done"):
-            return web.Response(status=400)
-        order = deps["get_repair_order_by_id"](oid)
-        if not order:
-            return web.Response(status=404)
-        pdf_bytes = deps["generate_act_pdf"](dict(order), act_type, _DEFAULT_LOGO_B64)
-        fname = f"{'Akt_Priema' if act_type == 'intake' else 'Akt_Rabot'}_{str(oid).zfill(4)}.pdf"
-        return web.Response(
-            body=pdf_bytes,
-            content_type="application/pdf",
-            headers={"Content-Disposition": f'attachment; filename="{fname}"'},
-        )
-
-    async def handle_send_act_pdf(request: web.Request) -> web.Response:
-        if not _has_perm(request, "can_repair_crm"):
-            return web.json_response({"error": "Forbidden"}, status=403)
-        oid = int(request.match_info["id"])
-        act_type = request.match_info["act_type"]
-        if act_type not in ("intake", "done"):
-            return web.json_response({"error": "Bad act type"}, status=400)
-        body = await request.json()
-        tg_id = int(body.get("tg_id") or 0)
-        if not tg_id and request["session"]["role"] == "owner":
-            tg_id = deps["get_owner_tg_id"]()
-        expected_h = deps["get_owner_hash"]() if request["session"]["role"] == "owner" else request["session"]["user_hash"]
-        if not tg_id or not expected_h or deps["hash_user_id"](tg_id) != expected_h:
-            return web.json_response({"error": "Forbidden"}, status=403)
-        order = deps["get_repair_order_by_id"](oid)
-        if not order:
-            return web.json_response({"error": "Not found"}, status=404)
-        pdf_bytes = deps["generate_act_pdf"](dict(order), act_type, _DEFAULT_LOGO_B64)
-        num = str(oid).zfill(4)
-        fname = f"{'Akt_Priema' if act_type == 'intake' else 'Akt_Rabot'}_{num}.pdf"
-        cap = f"📄 {'Акт приёма в ремонт' if act_type == 'intake' else 'Акт выполненных работ'} №{num}"
-        await bot.send_document(chat_id=tg_id, document=BufferedInputFile(pdf_bytes, filename=fname), caption=cap)
-        return web.json_response({"ok": True})
-
     app.router.add_get("/health", handle_health)
     app.router.add_get("/logout", handle_logout)
     app.router.add_get("/login", handle_login_get)
@@ -1819,8 +1754,6 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/api/repair/orders", handle_add_rep_order)
     app.router.add_post("/api/repair/orders/{id}/done", handle_done_rep_order)
     app.router.add_delete("/api/repair/orders/{id}", handle_del_rep_order)
-    app.router.add_get("/api/repair/orders/{id}/act/{act_type}.pdf", handle_get_act_pdf)
-    app.router.add_post("/api/repair/orders/{id}/act/{act_type}/send", handle_send_act_pdf)
     return app
 
 

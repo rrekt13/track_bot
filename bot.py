@@ -1122,10 +1122,8 @@ def root_menu_kb(user_id: int) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(text="📦 CRM", callback_data="crm_menu")])
     if has_perm(user_id, "can_post"):
         rows.append([InlineKeyboardButton(text="📝 Создать/Редактировать пост", callback_data="posts_menu")])
-    if has_perm(user_id, "can_parts_search"):
-        rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
-    if has_perm(user_id, "can_repair_crm"):
-        rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
+    if has_perm(user_id, "can_parts_search") or has_perm(user_id, "can_repair_crm"):
+        rows.append([InlineKeyboardButton(text="🛠 Сервис", callback_data="service_menu")])
     if has_perm(user_id, "can_personal_ledger"):
         rows.append([InlineKeyboardButton(text="💼 Мой учёт", callback_data="personal_menu")])
     if WEB_URL:
@@ -1709,12 +1707,22 @@ async def cb_pers_stats(callback: CallbackQuery) -> None:
 # РАЗДЕЛ 3: ПОИСК ЗАПЧАСТЕЙ И СРМ РЕМОНТ (РАЗДЕЛЬНЫЕ ВКЛАДКИ И ПРАВА)
 # ===========================================================================
 
+def service_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    rows = []
+    if has_perm(user_id, "can_repair_crm"):
+        rows.append([InlineKeyboardButton(text="🛠 СРМ Ремонт", callback_data="repair_crm_menu")])
+    if has_perm(user_id, "can_parts_search"):
+        rows.append([InlineKeyboardButton(text="🔍 Поиск запчастей", callback_data="parts_menu")])
+    rows.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 def parts_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🔍 Найти запчасть (MM / Moba / MEMS)", callback_data="rep_search")],
+            [InlineKeyboardButton(text="🔍 Найти запчасть (Moba)", callback_data="rep_search")],
             [InlineKeyboardButton(text="💰 Прайс за нашу работу", callback_data="rep_prices")],
-            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
+            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
         ]
     )
 
@@ -1723,10 +1731,24 @@ def repair_crm_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="➕ Принять устройство в ремонт", callback_data="rep_new_order")],
-            [InlineKeyboardButton(text="📋 Заказы в ремонте и акты", callback_data="rep_orders")],
-            [InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")],
+            [InlineKeyboardButton(text="📋 Заказы и акты", callback_data="rep_orders")],
+            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
         ]
     )
+
+
+@router.callback_query(F.data == "service_menu")
+async def cb_service_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
+        await callback.answer("Нет доступа к разделу Сервис", show_alert=True)
+        return
+    await state.clear()
+    await safe_edit_or_send(
+        callback.message,
+        "🛠 <b>Сервис (Qhead Mobile)</b>\nВыберите нужный инструмент:",
+        reply_markup=service_menu_kb(callback.from_user.id),
+    )
+    await callback.answer()
 
 
 @router.callback_query(F.data == "parts_menu")
@@ -1737,7 +1759,7 @@ async def cb_parts_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await callback.message.edit_text(
         "🔍 <b>Поиск запчастей (Москва)</b>\n"
-        "Поиск по <b>Master Mobile</b>, <b>Moba</b> и <b>MEMS</b> + расчёт цены с вашей работой:",
+        "Поиск по <b>Moba</b> + расчёт цены с вашей работой:",
         reply_markup=parts_menu_kb(),
     )
     await callback.answer()
@@ -1944,21 +1966,58 @@ async def cb_rep_orders(callback: CallbackQuery) -> None:
     if not has_perm(callback.from_user.id, "can_repair_crm"):
         return
     orders = get_repair_orders()
-    lines = ["📋 <b>Заказы СРМ Ремонт</b>\n"]
+    lines = ["📋 <b>Заказы СРМ Ремонт</b>\nНажмите на заказ, чтобы получить <b>Акт приёма</b> или <b>Акт выдачи</b>:\n"]
     rows = [[InlineKeyboardButton(text="➕ Принять устройство", callback_data="rep_new_order")]]
     if not orders:
         lines.append("<i>Заказов пока нет.</i>")
     else:
-        for o in orders[:10]:
-            st = "✅ Выдан" if o["status"] == "done" else "🛠 В работе"
+        for o in orders[:15]:
+            st_ico = "✅" if o["status"] == "done" else "🛠"
             num = str(o["id"]).zfill(4)
-            lines.append(f"• <b>№{num} {h(o['device_model'])}</b> ({h(o['client_name'] or o['client_info'])}) — {fmt_money(o['total_price'])} [{st}]")
-            if o["status"] == "in_work":
-                rows.append([InlineKeyboardButton(text=f"✅ Закрыть №{num} + Акт работ", callback_data=f"rep_done:{o['id']}")])
-            else:
-                rows.append([InlineKeyboardButton(text=f"📄 Акт работ №{num}", callback_data=f"rep_pdf_done:{o['id']}")])
+            cname = o["client_name"] or o["client_info"] or "Клиент"
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"{st_ico} №{num} • {o['device_model']} ({cname}) — {fmt_money(o['total_price'])}",
+                    callback_data=f"rep_view:{o['id']}",
+                )
+            ])
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="repair_crm_menu")])
     await safe_edit_or_send(callback.message, "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("rep_view:"))
+async def cb_rep_order_view(callback: CallbackQuery) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
+    oid = int(callback.data.split(":")[1])
+    o = get_repair_order_by_id(oid)
+    if not o:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    num = str(oid).zfill(4)
+    st = "✅ Выдан" if o["status"] == "done" else "🛠 В работе"
+    txt = (
+        f"📋 <b>Заказ №{num}</b> [{st}]\n\n"
+        f"📱 <b>Устройство:</b> {h(o['device_model'])}\n"
+        f"👤 <b>Клиент:</b> {h(o['client_name'] or o['client_info'] or '—')} ({h(o['client_phone'] or 'без тел.')})\n"
+        f"🔢 <b>IMEI / SN:</b> {h(o['imei_sn'] or '—')}\n"
+        f"🛠 <b>Неисправность:</b> {h(o['issue_desc'] or o['service_name'] or '—')}\n"
+        f"👀 <b>Внешний вид:</b> {h(o['appearance'] or '—')}\n"
+        f"💵 <b>Итого:</b> {fmt_money(o['total_price'])} (Предоплата: {fmt_money(o['prepayment'])})\n"
+        f"🛡 <b>Гарантия:</b> {int(o['warranty_days'] or 0)} дн."
+    )
+    rows = [
+        [
+            InlineKeyboardButton(text=f"📄 Акт приёма №{num}", callback_data=f"rep_pdf_intake:{oid}"),
+            InlineKeyboardButton(text=f"📄 Акт выдачи №{num}", callback_data=f"rep_pdf_done:{oid}"),
+        ]
+    ]
+    if o["status"] != "done":
+        rows.append([InlineKeyboardButton(text=f"✅ Закрыть ремонт + Акт выдачи", callback_data=f"rep_done:{oid}")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить заказ", callback_data=f"rep_del:{oid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К списку заказов", callback_data="rep_orders")])
+    await safe_edit_or_send(callback.message, txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -2191,6 +2250,38 @@ async def cb_rep_pdf_done(callback: CallbackQuery) -> None:
     except Exception as e:
         logger.exception(f"PDF generation error for order {oid}: {e}")
         await callback.answer(f"Ошибка PDF: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rep_pdf_intake:"))
+async def cb_rep_pdf_intake(callback: CallbackQuery) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
+    oid = int(callback.data.split(":")[1])
+    row = get_repair_order_by_id(oid)
+    if not row:
+        await callback.answer("Заказ не найден", show_alert=True)
+        return
+    try:
+        pdf_bytes = generate_act_pdf(dict(row), "intake")
+        num = str(oid).zfill(4)
+        await callback.message.answer_document(
+            BufferedInputFile(pdf_bytes, filename=f"Akt_Priema_{num}.pdf"),
+            caption=f"📄 Акт приёма в ремонт №{num}",
+        )
+        await callback.answer("Акт приёма отправлен")
+    except Exception as e:
+        logger.exception(f"PDF intake error for order {oid}: {e}")
+        await callback.answer(f"Ошибка PDF: {e}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("rep_del:"))
+async def cb_rep_del(callback: CallbackQuery) -> None:
+    if not has_perm(callback.from_user.id, "can_repair_crm"):
+        return
+    oid = int(callback.data.split(":")[1])
+    delete_repair_order(oid)
+    await callback.answer("Заказ удалён")
+    await cb_rep_orders(callback)
 
 
 # ===========================================================================
