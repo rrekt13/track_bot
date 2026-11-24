@@ -476,25 +476,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="postsList" class="posts-grid"></div>
     </section>
 
-    <section id="view-parts" style="display:none">
-      <div class="toolbar">
-        <input class="search" id="repQuery" placeholder="Поиск запчастей (напр. экран 11 айфон)..." onkeydown="if(event.key==='Enter') runRepairSearch()">
-        <button class="btn btn-orange" id="repSearchBtn" onclick="runRepairSearch()">Найти</button>
+    <section id="view-service" style="display:none">
+      <div style="display:flex;gap:8px;margin-bottom:14px;background:var(--card);border:1px solid var(--border);padding:5px;border-radius:14px">
+        <button id="srvBtnRepair" type="button" class="btn btn-orange" style="flex:1;justify-content:center" onclick="switchServiceSub('repair')">СРМ Ремонт</button>
+        <button id="srvBtnParts" type="button" class="btn btn-dark" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('parts')">Запчасти (Moba)</button>
       </div>
-      <div id="repResults" style="margin-bottom:18px"></div>
-      <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0">
-        <div class="sec-title" style="margin:0">Прайс за нашу работу</div>
-        <button class="btn btn-dark btn-sm" onclick="openNewRepPrice()">+ Услуга</button>
+      <div id="view-repair">
+        <div class="toolbar">
+          <input class="search" id="repOrderSearch" placeholder="Поиск по клиенту, телефону, модели..." oninput="render()">
+          <button class="btn btn-orange" onclick="openNewRepOrder()">+ Принять в ремонт</button>
+        </div>
+        <div id="repOrdersList" class="posts-grid"></div>
       </div>
-      <div id="repPricesList" class="kpi-grid"></div>
-    </section>
-
-    <section id="view-repair" style="display:none">
-      <div class="toolbar">
-        <input class="search" id="repOrderSearch" placeholder="Поиск по клиенту, телефону, модели..." oninput="render()">
-        <button class="btn btn-orange" onclick="openNewRepOrder()">+ Принять в ремонт</button>
+      <div id="view-parts" style="display:none">
+        <div class="toolbar">
+          <input class="search" id="repQuery" placeholder="Поиск запчастей (напр. экран 11 айфон)..." onkeydown="if(event.key==='Enter') runRepairSearch()">
+          <button class="btn btn-orange" id="repSearchBtn" onclick="runRepairSearch()">Найти</button>
+        </div>
+        <div id="repResults" style="margin-bottom:18px"></div>
+        <div style="display:flex;justify-content:space-between;align-items:center;margin:10px 0">
+          <div class="sec-title" style="margin:0">Прайс за нашу работу</div>
+          <button class="btn btn-dark btn-sm" onclick="openNewRepPrice()">+ Услуга</button>
+        </div>
+        <div id="repPricesList" class="kpi-grid"></div>
       </div>
-      <div id="repOrdersList" class="posts-grid"></div>
     </section>
 
     <section id="view-archive" style="display:none">
@@ -522,13 +527,9 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>
       Посты
     </button>
-    <button class="dock-btn" data-tab="parts" onclick="switchTab('parts')">
-      <svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
-      Запчасти
-    </button>
-    <button class="dock-btn" data-tab="repair" onclick="switchTab('repair')">
+    <button class="dock-btn" data-tab="service" onclick="switchTab('service')">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94z"/></svg>
-      Ремонт
+      Сервис
     </button>
     <button class="dock-btn" data-tab="archive" onclick="switchTab('archive')">
       <svg viewBox="0 0 24 24" fill="none" stroke-width="1.9"><rect x="3" y="4" width="18" height="4" rx="1"/><path d="M5 8v11a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8"/><line x1="10" y1="13" x2="14" y2="13"/></svg>
@@ -583,6 +584,7 @@ __FALL_JS__
 const ALL_DEVICES = __ALL_DEVICES__;
 let STATE = { role: 'owner', perms: {}, finances: {}, shipments: [], posts: [], direct_items: [], unsold_my: [], repair_prices: [], repair_orders: [] };
 let CURRENT_TAB = 'home';
+let SERVICE_SUB = 'repair';
 let LAST_REPAIR_SEARCH = null;
 
 function esc(s) {
@@ -602,10 +604,32 @@ function copyText(txt) {
   navigator.clipboard?.writeText(txt);
   toast('Скопировано: ' + txt);
 }
+function switchServiceSub(sub) {
+  SERVICE_SUB = sub;
+  const rEl = document.getElementById('view-repair');
+  const pEl = document.getElementById('view-parts');
+  const br = document.getElementById('srvBtnRepair');
+  const bp = document.getElementById('srvBtnParts');
+  if (rEl && pEl) {
+    rEl.style.display = (sub === 'repair') ? '' : 'none';
+    pEl.style.display = (sub === 'parts') ? '' : 'none';
+  }
+  if (br && bp) {
+    br.className = sub === 'repair' ? 'btn btn-orange' : 'btn btn-dark';
+    bp.className = sub === 'parts' ? 'btn btn-orange' : 'btn btn-dark';
+  }
+  if (sub === 'repair') renderRepairCRM();
+  if (sub === 'parts') renderParts();
+}
+
 function switchTab(tab) {
+  if (tab === 'parts' || tab === 'repair') {
+    SERVICE_SUB = tab;
+    tab = 'service';
+  }
   CURRENT_TAB = tab;
   document.querySelectorAll('.dock-btn').forEach(b => b.classList.toggle('active', b.dataset.tab === tab));
-  ['home','crm','direct','posts','parts','repair','archive'].forEach(t => {
+  ['home','crm','direct','posts','service','archive'].forEach(t => {
     document.getElementById('view-' + t).style.display = (t === tab) ? '' : 'none';
   });
   document.getElementById('bgFall').style.opacity = (tab === 'home') ? '1' : '0.2';
@@ -644,8 +668,7 @@ function render() {
     if (t === 'crm' || t === 'archive') show = !!perms.can_crm;
     if (t === 'posts') show = !!perms.can_post;
     if (t === 'direct') show = !!perms.can_personal_ledger;
-    if (t === 'parts') show = !!perms.can_parts_search;
-    if (t === 'repair') show = !!perms.can_repair_crm;
+    if (t === 'service') show = !!(perms.can_parts_search || perms.can_repair_crm);
     b.style.display = show ? '' : 'none';
   });
 
@@ -654,8 +677,15 @@ function render() {
   if (CURRENT_TAB === 'archive') renderShipments('archived', 'archList', 'archSearch');
   if (CURRENT_TAB === 'direct') renderDirect();
   if (CURRENT_TAB === 'posts') renderPosts();
-  if (CURRENT_TAB === 'parts') renderParts();
-  if (CURRENT_TAB === 'repair') renderRepairCRM();
+  if (CURRENT_TAB === 'service') {
+    if (!perms.can_repair_crm && perms.can_parts_search) SERVICE_SUB = 'parts';
+    if (!perms.can_parts_search && perms.can_repair_crm) SERVICE_SUB = 'repair';
+    const br = document.getElementById('srvBtnRepair');
+    const bp = document.getElementById('srvBtnParts');
+    if (br) br.style.display = perms.can_repair_crm ? '' : 'none';
+    if (bp) bp.style.display = perms.can_parts_search ? '' : 'none';
+    switchServiceSub(SERVICE_SUB);
+  }
 }
 
 function renderHome(isAdmin, perms) {

@@ -1833,7 +1833,7 @@ async def msg_rep_search(message: Message, state: FSMContext) -> None:
                     lines.append(
                         f"{stock} <a href=\"{h(it['url'])}\">{h(it['title'][:85])}</a>\n"
                         f"   Качество: <b>{h(it['quality'])}</b>\n"
-                        f"   <sub>Запчасть: {fmt_money(it['price'])}</sub> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
+                        f"   <i>Запчасть: {fmt_money(it['price'])}</i> + Работа: {fmt_money(work_price)} → <b>Итого: {fmt_money(total)}</b>"
                     )
             lines.append("")
 
