@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import hashlib
+import io
 import hmac
 import logging
 import os
@@ -614,6 +615,14 @@ let LAST_REPAIR_SEARCH = null;
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+function fmtDateMsk(ts) {
+  if (!ts) return '—';
+  const m = String(ts).match(/(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})/);
+  if (!m) return String(ts).slice(0, 16);
+  const d = new Date(Date.UTC(+m[1], +m[2]-1, +m[3], +m[4], +m[5]) + 3 * 3600 * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${p(d.getUTCDate())}.${p(d.getUTCMonth()+1)}.${d.getUTCFullYear()} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}`;
+}
 function fmtMoney(v) {
   const n = Number(v || 0);
   return Math.round(n).toLocaleString('ru-RU') + ' ₽';
@@ -650,35 +659,71 @@ function renderTasks() {
   const peopleMap = Object.fromEntries((STATE.assignable_people || []).map(p => [p.user_hash, p.label]));
   el.innerHTML = list.map(t => {
     const num = String(t.id).padStart(3, '0');
-    const p = t.payload || {};
-    const typeLbl = t.task_type === 'ship' ? '📦 Отправить клиенту' : (t.task_type === 'handover' ? '🤝 Передать клиенту' : '🛒 Купить запчасти');
-    let details = '';
-    if (t.task_type === 'ship') {
-      details = `<div><b>Пункт:</b> ${esc(p.pickup || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация / где:</b> ${esc(p.location || '—')}</div>`;
-    } else if (t.task_type === 'handover') {
-      details = `<div><b>Время:</b> ${esc(p.time || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация / где:</b> ${esc(p.location || '—')}</div>`;
-    } else {
-      const items = p.items || [];
-      const tot = items.reduce((a,b) => a + Number(b.price || 0), 0);
-      details = `<div><b>Где:</b> ${esc(p.place || '—')}</div>` + items.map((x,i) => `<div>${i+1}. ${esc(x.name)} — <b>${fmtMoney(x.price)}</b></div>`).join('') + `<div style="margin-top:4px;color:#ff8a3d"><b>Итого: ${fmtMoney(tot)}</b></div>`;
-    }
+    const typeLbl = t.task_type === 'ship' ? '📦 Отправить' : (t.task_type === 'handover' ? '🤝 Передать' : '🛒 Купить');
     const assNames = (t.assignees || []).map(h => peopleMap[h] || 'Админ').join(', ') || '—';
-    const ivTxt = t.interval_minutes > 0 ? `каждые ${t.interval_minutes} мин.` : 'без повторов';
-    const stBadge = t.status === 'done' ? '<span class="badge badge-sold">Выполнена</span>' : `<span class="badge badge-active">Активна (${ivTxt})</span>`;
-    const photoHtml = t.photo_url ? `<img src="${esc(t.photo_url)}" style="width:100%;max-height:140px;object-fit:cover;border-radius:10px;margin-top:8px">` : '';
-    const doneBtn = t.status === 'active' ? `<button class="btn btn-green btn-sm" onclick="markTaskDoneWeb(${t.id})">Выполнена</button>` : '';
+    const ivTxt = t.interval_minutes > 0 ? `${t.interval_minutes} мин` : '1 раз';
+    const isDone = t.status === 'done';
+    const stBadge = isDone
+      ? `<span class="badge badge-sold">Выполнена • ${fmtDateMsk(t.done_at)}</span>`
+      : `<span class="badge badge-active">Активна • ${ivTxt}</span>`;
+    const photoBadge = (!isDone && t.photo_url) ? `<span class="badge" style="background:rgba(255,255,255,.08);color:#e4e4e7">📷 Фото</span>` : '';
+    const doneBtn = !isDone ? `<button class="btn btn-green btn-sm" onclick="event.stopPropagation();markTaskDoneWeb(${t.id})">Выполнена</button>` : '';
     return `
-      <div class="post-card">
+      <div class="post-card" style="cursor:pointer" onclick="openTaskDetail(${t.id})">
         <div>
-          <div class="post-head"><div class="post-title">${typeLbl} #${num}</div></div>
-          <div style="font-size:12px;color:#d4d4d8;margin-top:6px;line-height:1.5">${details}</div>
-          <div style="font-size:11px;color:var(--muted);margin-top:6px">Кому: ${esc(assNames)}</div>
-          ${photoHtml}
-          <div style="margin-top:8px">${stBadge}</div>
+          <div class="post-head">
+            <div class="post-title">${typeLbl} #${num}</div>
+            <span style="font-size:11px;color:var(--muted)">${fmtDateMsk(t.created_at)}</span>
+          </div>
+          <div style="font-size:13px;font-weight:600;color:#fff;margin-top:6px">${esc(t.title)}</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:5px">Кому: ${esc(assNames)}</div>
+          <div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:8px">${stBadge}${photoBadge}</div>
         </div>
-        <div class="post-foot">${doneBtn}<button class="btn btn-red btn-sm" onclick="delTaskWeb(${t.id})">Удал.</button></div>
+        <div class="post-foot">${doneBtn}<button class="btn btn-dark btn-sm" onclick="event.stopPropagation();openTaskDetail(${t.id})">Открыть</button></div>
       </div>`;
   }).join('');
+}
+
+function openTaskDetail(id) {
+  const t = (STATE.tasks || []).find(x => x.id === id);
+  if (!t) return;
+  const num = String(t.id).padStart(3, '0');
+  const p = t.payload || {};
+  const peopleMap = Object.fromEntries((STATE.assignable_people || []).map(x => [x.user_hash, x.label]));
+  const assNames = (t.assignees || []).map(h => peopleMap[h] || 'Админ').join(', ') || '—';
+  const typeLbl = t.task_type === 'ship' ? '📦 Отправить товар клиенту' : (t.task_type === 'handover' ? '🤝 Передать товар клиенту' : '🛒 Купить запчасти');
+  let details = '';
+  if (t.task_type === 'ship') {
+    details = `<div><b>Пункт выдачи:</b> ${esc(p.pickup || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация и где лежит:</b> ${esc(p.location || '—')}</div>`;
+  } else if (t.task_type === 'handover') {
+    details = `<div><b>Время визита:</b> ${esc(p.time || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация и где лежит:</b> ${esc(p.location || '—')}</div>`;
+  } else {
+    const items = p.items || [];
+    const tot = items.reduce((a,b) => a + Number(b.price || 0), 0);
+    details = `<div><b>Где купить:</b> ${esc(p.place || '—')}</div>` + items.map((x,i) => `<div>${i+1}. ${esc(x.name)} — <b>${fmtMoney(x.price)}</b></div>`).join('') + `<div style="margin-top:6px;color:#ff8a3d"><b>Итого: ${fmtMoney(tot)}</b></div>`;
+  }
+  const photoHtml = (t.status === 'active' && t.photo_url)
+    ? `<div style="margin-top:10px"><img src="${esc(t.photo_url)}" style="width:100%;max-height:280px;object-fit:contain;background:#0a0a0f;border-radius:12px"></div>`
+    : '';
+  const doneInfo = t.status === 'done' ? `<div><b>Выполнена:</b> ${fmtDateMsk(t.done_at)}</div>` : '';
+  const doneBtn = t.status === 'active' ? `<button class="btn btn-green" onclick="closeModal();markTaskDoneWeb(${t.id})">✅ Выполнена</button>` : '';
+  openModal(`
+    <h3>${typeLbl} #${num}</h3>
+    <div style="font-size:13px;color:#e4e4e7;line-height:1.6;background:rgba(255,255,255,.04);padding:12px;border-radius:12px;margin-bottom:10px">
+      ${details}
+      <hr style="border:none;border-top:1px solid var(--border);margin:8px 0">
+      <div><b>Кому:</b> ${esc(assNames)}</div>
+      <div><b>Создана:</b> ${fmtDateMsk(t.created_at)}</div>
+      ${doneInfo}
+      <div><b>Напоминания:</b> ${t.interval_minutes > 0 ? 'каждые ' + t.interval_minutes + ' мин.' : 'без повторов'}</div>
+    </div>
+    ${photoHtml}
+    <div class="modal-btns">
+      ${doneBtn}
+      <button class="btn btn-red" onclick="closeModal();delTaskWeb(${t.id})">Удалить</button>
+      <button class="btn btn-dark" onclick="closeModal()">Закрыть</button>
+    </div>
+  `);
 }
 
 function openNewTaskModal() {
@@ -982,15 +1027,22 @@ function renderHome(isAdmin, perms) {
   el.innerHTML = `
     <div class="hero-card">
       <div class="hero-row">
-        <div><div class="hero-lbl">Всего вложено (товары + доставка + ремонт)</div><div class="hero-val">${fmtMoney(f.total_spent)}</div></div>
-        <div style="text-align:right"><div class="hero-lbl">Чистая прибыль</div><div class="hero-sub">${fmtMoney(f.sold_profit_items)}</div></div>
+        <div><div class="hero-lbl">Товары и доставка (вложено)</div><div class="hero-val">${fmtMoney(f.total_spent)}</div></div>
+        <div style="text-align:right"><div class="hero-lbl">Чистая прибыль (товары)</div><div class="hero-sub">${fmtMoney(f.sold_profit_items)}</div></div>
       </div>
     </div>
     <div class="kpi-grid">
       <div class="kpi"><div class="kpi-label">В пути (мои товары)</div><div class="kpi-val orange">${fmtMoney(f.invested_active)}</div></div>
       <div class="kpi"><div class="kpi-label">Доставка (архив)</div><div class="kpi-val">${fmtMoney(f.delivery_total)}</div></div>
       <div class="kpi"><div class="kpi-label">Выручка с продаж</div><div class="kpi-val green">${fmtMoney(f.revenue_total)}</div></div>
-      <div class="kpi"><div class="kpi-label">Общий баланс</div><div class="kpi-val ${Number(f.net_overall||0)>=0?'green':'orange'}">${fmtMoney(f.net_overall)}</div></div>
+      <div class="kpi"><div class="kpi-label">Баланс (товары)</div><div class="kpi-val ${Number(f.net_overall||0)>=0?'green':'orange'}">${fmtMoney(f.net_overall)}</div></div>
+    </div>
+    <div class="sec-title">Бюджет СРМ Ремонт</div>
+    <div class="kpi-grid">
+      <div class="kpi"><div class="kpi-label">Прибыль с ремонта</div><div class="kpi-val green">${fmtMoney(f.rep_profit)}</div></div>
+      <div class="kpi"><div class="kpi-label">Выручка ремонта (${f.rep_done_count || 0} шт.)</div><div class="kpi-val">${fmtMoney(f.rep_revenue)}</div></div>
+      <div class="kpi"><div class="kpi-label">Запчасти (списано)</div><div class="kpi-val orange">${fmtMoney(f.rep_parts_cost)}</div></div>
+      <div class="kpi"><div class="kpi-label">В работе (${f.rep_in_work_count || 0} шт.)</div><div class="kpi-val">${fmtMoney(f.rep_in_work_parts)}</div></div>
     </div>
     <div class="sec-title">Быстрые действия</div>
     <div class="quick-grid">
@@ -1213,7 +1265,7 @@ function renderRepairCRM() {
             <div class="post-title">№${num} • ${esc(o.device_model)}</div>
             <span class="post-price">${fmtMoney(o.total_price)}</span>
           </div>
-          <div class="meta-row" style="margin-top:6px">${esc(o.client_name || o.client_info)} • ${esc(o.client_phone || 'без тел.')}</div>
+          <div class="meta-row" style="margin-top:6px">${esc(o.client_name || o.client_info)} • ${esc(o.client_phone || 'без тел.')} • ${fmtDateMsk(o.created_at)}</div>
           ${o.issue_desc ? `<div style="font-size:12px;color:#d4d4d8;margin-top:6px">${esc(o.issue_desc)}</div>` : ''}
           <div style="margin-top:8px">${stBadge}</div>
         </div>
@@ -1756,7 +1808,13 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
             "repair_prices": [dict(r) for r in deps["get_repair_prices"]()] if perms["can_parts_search"] else [],
             "repair_orders": [dict(o) for o in deps["get_repair_orders"]()] if perms["can_repair_crm"] else [],
             "tasks": [
-                {**t, "photo_url": (f"/api/photo/{t['photo_ref']}" if (t.get("photo_ref") or "").startswith("web_") else "")}
+                {
+                    **t,
+                    "photo_url": (
+                        "" if t.get("status") == "done" or not t.get("photo_ref")
+                        else (f"/api/photo/{t['photo_ref']}" if t["photo_ref"].startswith("web_") else f"/api/tg_photo/{t['photo_ref']}")
+                    ),
+                }
                 for t in deps["get_tasks"](None, None if is_owner else sess["user_hash"])
             ] if (perms["can_parts_search"] or perms["can_repair_crm"]) else [],
             "assignable_people": deps["get_assignable_people"]() if (perms["can_parts_search"] or perms["can_repair_crm"]) else [],
@@ -2034,7 +2092,20 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
     app.router.add_post("/api/direct", handle_create_direct)
     app.router.add_post("/api/direct/{id}/sell", handle_sell_direct)
     app.router.add_delete("/api/direct/{id}", handle_delete_direct)
+    async def handle_get_tg_photo(request: web.Request) -> web.Response:
+        fid = request.match_info["file_id"]
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{10,160}", fid):
+            return web.Response(status=400)
+        try:
+            tg_file = await bot.get_file(fid)
+            buf = io.BytesIO()
+            await bot.download_file(tg_file.file_path, destination=buf)
+            return web.Response(body=buf.getvalue(), content_type="image/jpeg", headers={"Cache-Control": "private, max-age=1800"})
+        except Exception:
+            return web.Response(status=404)
+
     app.router.add_get("/api/photo/{name}", handle_get_photo)
+    app.router.add_get("/api/tg_photo/{file_id}", handle_get_tg_photo)
     async def handle_srv_imei(request: web.Request) -> web.Response:
         if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
             return web.json_response({"error": "Forbidden"}, status=403)

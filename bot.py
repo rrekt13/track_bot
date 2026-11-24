@@ -8,6 +8,7 @@ import os
 import re
 import sqlite3
 import time
+from datetime import datetime, timedelta
 from contextlib import closing
 from html import escape as h
 from acts import generate_act_pdf
@@ -77,6 +78,16 @@ def parse_amount(raw: str) -> float:
         return float(num_str)
     except ValueError:
         return 0.0
+
+
+def fmt_msk(ts: str) -> str:
+    if not ts:
+        return "—"
+    try:
+        dt = datetime.strptime(str(ts)[:19], "%Y-%m-%d %H:%M:%S") + timedelta(hours=3)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return str(ts)[:16]
 
 
 def fmt_money(val: float) -> str:
@@ -815,14 +826,13 @@ def get_crm_finances() -> dict:
 
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.row_factory = sqlite3.Row
-        rep_rows = conn.execute("SELECT * FROM repair_orders WHERE status = 'done'").fetchall()
-    for rr in rep_rows:
-        pcost = float(rr["part_cost"] or 0.0)
-        tprice = float(rr["total_price"] or 0.0)
-        invested_total += pcost
-        sold_cost += pcost
-        revenue_total += tprice
-        sold_count += 1
+        rep_done = conn.execute("SELECT * FROM repair_orders WHERE status = 'done'").fetchall()
+        rep_work = conn.execute("SELECT * FROM repair_orders WHERE status != 'done'").fetchall()
+
+    rep_parts_cost = sum(float(rr["part_cost"] or 0.0) for rr in rep_done)
+    rep_revenue = sum(float(rr["total_price"] or 0.0) for rr in rep_done)
+    rep_profit = rep_revenue - rep_parts_cost
+    rep_in_work_parts = sum(float(rr["part_cost"] or 0.0) for rr in rep_work)
 
     delivery_total = float(deliveries["total_delivery"] or 0.0)
     return {
@@ -835,6 +845,12 @@ def get_crm_finances() -> dict:
         "net_overall": revenue_total - (invested_total + delivery_total),
         "sold_count": sold_count,
         "in_stock_count": in_stock_count,
+        "rep_parts_cost": rep_parts_cost,
+        "rep_revenue": rep_revenue,
+        "rep_profit": rep_profit,
+        "rep_done_count": len(rep_done),
+        "rep_in_work_count": len(rep_work),
+        "rep_in_work_parts": rep_in_work_parts,
     }
 
 
@@ -1152,6 +1168,14 @@ def get_task_by_id(task_id: int) -> Optional[dict[str, Any]]:
 
 
 def mark_task_done(task_id: int) -> None:
+    t = get_task_by_id(task_id)
+    if t and (t.get("photo_ref") or "").startswith("web_"):
+        fpath = os.path.join(os.path.dirname(DB_PATH) or ".", "web_photos", t["photo_ref"])
+        try:
+            if os.path.isfile(fpath):
+                os.remove(fpath)
+        except Exception:
+            pass
     with closing(sqlite3.connect(DB_PATH)) as conn:
         conn.execute("UPDATE tasks SET status = 'done', done_at = CURRENT_TIMESTAMP WHERE id = ?", (task_id,))
         conn.commit()
@@ -1194,7 +1218,10 @@ def format_task_html(t: dict[str, Any], is_reminder: bool = False) -> str:
         )
     iv = int(t.get("interval_minutes") or 0)
     iv_txt = f"каждые {iv} мин." if iv > 0 else "без повторов"
-    return f"{hdr}\n\n{body}\n\n⏱ <i>Напоминания: {iv_txt}</i>"
+    dt_txt = f"📅 Создана: {fmt_msk(t.get('created_at', ''))}"
+    if t.get("status") == "done" and t.get("done_at"):
+        dt_txt += f"\n✅ Выполнена: {fmt_msk(t.get('done_at', ''))}"
+    return f"{hdr}\n\n{body}\n\n{dt_txt}\n⏱ <i>Напоминания: {iv_txt}</i>"
 
 
 async def send_task_notification(bot: Bot, task_id: int, is_reminder: bool = False) -> None:
@@ -2172,7 +2199,25 @@ async def cb_task_view(callback: CallbackQuery) -> None:
         rows.append([InlineKeyboardButton(text="✅ Задача выполнена", callback_data=f"task_done:{t['id']}")])
     rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"task_del:{t['id']}")])
     rows.append([InlineKeyboardButton(text="⬅️ К задачам", callback_data="tasks_menu")])
-    await safe_edit_or_send(callback.message, format_task_html(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
+    txt = format_task_html(t)
+    pref = t.get("photo_ref") or ""
+    if t["status"] == "active" and pref:
+        try:
+            if pref.startswith("web_"):
+                fpath = os.path.join(os.path.dirname(DB_PATH) or ".", "web_photos", pref)
+                if os.path.isfile(fpath):
+                    with open(fpath, "rb") as pf:
+                        await callback.message.answer_photo(BufferedInputFile(pf.read(), filename=pref), caption=txt, reply_markup=kb)
+                    await callback.answer()
+                    return
+            else:
+                await callback.message.answer_photo(pref, caption=txt, reply_markup=kb)
+                await callback.answer()
+                return
+        except Exception:
+            pass
+    await safe_edit_or_send(callback.message, txt, reply_markup=kb)
     await callback.answer()
 
 
@@ -2698,7 +2743,7 @@ async def cb_rep_order_view(callback: CallbackQuery) -> None:
         f"🛠 <b>Неисправность:</b> {h(o['issue_desc'] or o['service_name'] or '—')}\n"
         f"👀 <b>Внешний вид:</b> {h(o['appearance'] or '—')}\n"
         f"💵 <b>Итого:</b> {fmt_money(o['total_price'])} (Предоплата: {fmt_money(o['prepayment'])})\n"
-        f"🛡 <b>Гарантия:</b> {int(o['warranty_days'] or 0)} дн."
+        f"🛡 <b>Гарантия:</b> {int(o['warranty_days'] or 0)} дн.\n📅 <b>Принят:</b> {fmt_msk(o.get('created_at', ''))}"
     )
     rows = [
         [
