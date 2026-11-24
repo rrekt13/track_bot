@@ -482,6 +482,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <button id="srvBtnParts" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('parts')">Запчасти</button>
         <button id="srvBtnImei" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('imei')">IMEI / iCloud</button>
         <button id="srvBtnPanic" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('panic')">Panic-логи</button>
+        <button id="srvBtnTasks" type="button" class="btn btn-dark btn-sm" style="flex:1;justify-content:center;border:none" onclick="switchServiceSub('tasks')">Задачи</button>
       </div>
       <div id="view-repair">
         <div class="toolbar">
@@ -516,6 +517,12 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <button class="btn btn-orange" onclick="runPanicCheck()">Разобрать Panic-лог</button>
         </div>
         <div id="panicResult"></div>
+      </div>
+      <div id="view-tasks" style="display:none">
+        <div class="toolbar">
+          <button class="btn btn-orange" onclick="openNewTaskModal()">+ Новая задача</button>
+        </div>
+        <div id="tasksList" class="posts-grid"></div>
       </div>
     </section>
 
@@ -623,7 +630,7 @@ function copyText(txt) {
 }
 function switchServiceSub(sub) {
   SERVICE_SUB = sub;
-  const map = { repair: ['view-repair','srvBtnRepair'], parts: ['view-parts','srvBtnParts'], imei: ['view-imei','srvBtnImei'], panic: ['view-panic','srvBtnPanic'] };
+  const map = { repair: ['view-repair','srvBtnRepair'], parts: ['view-parts','srvBtnParts'], imei: ['view-imei','srvBtnImei'], panic: ['view-panic','srvBtnPanic'], tasks: ['view-tasks','srvBtnTasks'] };
   for (const [k, [vId, bId]] of Object.entries(map)) {
     const v = document.getElementById(vId);
     const b = document.getElementById(bId);
@@ -632,6 +639,160 @@ function switchServiceSub(sub) {
   }
   if (sub === 'repair') renderRepairCRM();
   if (sub === 'parts') renderParts();
+  if (sub === 'tasks') renderTasks();
+}
+
+
+function renderTasks() {
+  const el = document.getElementById('tasksList');
+  const list = STATE.tasks || [];
+  if (!list.length) { el.innerHTML = '<div class="empty">Задач пока нет</div>'; return; }
+  const peopleMap = Object.fromEntries((STATE.assignable_people || []).map(p => [p.user_hash, p.label]));
+  el.innerHTML = list.map(t => {
+    const num = String(t.id).padStart(3, '0');
+    const p = t.payload || {};
+    const typeLbl = t.task_type === 'ship' ? '📦 Отправить клиенту' : (t.task_type === 'handover' ? '🤝 Передать клиенту' : '🛒 Купить запчасти');
+    let details = '';
+    if (t.task_type === 'ship') {
+      details = `<div><b>Пункт:</b> ${esc(p.pickup || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация / где:</b> ${esc(p.location || '—')}</div>`;
+    } else if (t.task_type === 'handover') {
+      details = `<div><b>Время:</b> ${esc(p.time || '—')}</div><div><b>Товар:</b> ${esc(p.item || '—')}</div><div><b>Комплектация / где:</b> ${esc(p.location || '—')}</div>`;
+    } else {
+      const items = p.items || [];
+      const tot = items.reduce((a,b) => a + Number(b.price || 0), 0);
+      details = `<div><b>Где:</b> ${esc(p.place || '—')}</div>` + items.map((x,i) => `<div>${i+1}. ${esc(x.name)} — <b>${fmtMoney(x.price)}</b></div>`).join('') + `<div style="margin-top:4px;color:#ff8a3d"><b>Итого: ${fmtMoney(tot)}</b></div>`;
+    }
+    const assNames = (t.assignees || []).map(h => peopleMap[h] || 'Админ').join(', ') || '—';
+    const ivTxt = t.interval_minutes > 0 ? `каждые ${t.interval_minutes} мин.` : 'без повторов';
+    const stBadge = t.status === 'done' ? '<span class="badge badge-sold">Выполнена</span>' : `<span class="badge badge-active">Активна (${ivTxt})</span>`;
+    const photoHtml = t.photo_url ? `<img src="${esc(t.photo_url)}" style="width:100%;max-height:140px;object-fit:cover;border-radius:10px;margin-top:8px">` : '';
+    const doneBtn = t.status === 'active' ? `<button class="btn btn-green btn-sm" onclick="markTaskDoneWeb(${t.id})">Выполнена</button>` : '';
+    return `
+      <div class="post-card">
+        <div>
+          <div class="post-head"><div class="post-title">${typeLbl} #${num}</div></div>
+          <div style="font-size:12px;color:#d4d4d8;margin-top:6px;line-height:1.5">${details}</div>
+          <div style="font-size:11px;color:var(--muted);margin-top:6px">Кому: ${esc(assNames)}</div>
+          ${photoHtml}
+          <div style="margin-top:8px">${stBadge}</div>
+        </div>
+        <div class="post-foot">${doneBtn}<button class="btn btn-red btn-sm" onclick="delTaskWeb(${t.id})">Удал.</button></div>
+      </div>`;
+  }).join('');
+}
+
+function openNewTaskModal() {
+  const people = STATE.assignable_people || [];
+  const peopleChecks = people.map(p =>
+    `<label style="display:flex;align-items:center;gap:8px;font-size:13px;padding:6px 8px;background:rgba(255,255,255,.04);border-radius:9px;cursor:pointer"><input type="checkbox" class="t-ass-chk" value="${esc(p.user_hash)}"> ${esc(p.label)}</label>`
+  ).join('');
+  openModal(`
+    <h3>Новая задача</h3>
+    <div class="field">
+      <label>Тип задачи</label>
+      <select id="tType" onchange="switchTaskFormType()">
+        <option value="ship">📦 Отправить товар клиенту</option>
+        <option value="handover">🤝 Передать товар клиенту</option>
+        <option value="buy">🛒 Купить запчасти</option>
+      </select>
+    </div>
+    <div id="tFormShip">
+      <div class="field">
+        <label>Пункт выдачи / служба</label>
+        <div style="display:flex;flex-wrap:wrap;gap:5px;margin-bottom:6px">
+          ${['Яндекс','СДЭК','Авито','Почта России','5Post'].map(x => `<button type="button" class="btn btn-dark btn-sm" onclick="document.getElementById('tPickup').value='${x}'">${x}</button>`).join('')}
+        </div>
+        <input id="tPickup" placeholder="Яндекс / СДЭК / Авито...">
+      </div>
+      <div class="field"><label>Какой товар</label><input id="tShipItem" placeholder="Напр. iPhone 13 128GB"></div>
+      <div class="field"><label>Комплектация и где лежит</label><input id="tShipLoc" placeholder="Коробка + кабель, на нижней полке"></div>
+      <div class="field"><label>Фото штрих-кода (необязательно)</label><input type="file" id="tShipPhoto" accept="image/*"></div>
+    </div>
+    <div id="tFormHand" style="display:none">
+      <div class="field"><label>В какое время будет клиент</label><input id="tHandTime" placeholder="Сегодня в 17:30"></div>
+      <div class="field"><label>Какой товар</label><input id="tHandItem" placeholder="Напр. Nintendo Switch OLED"></div>
+      <div class="field"><label>Комплектация и где лежит</label><input id="tHandLoc" placeholder="Полный комплект, на витрине"></div>
+    </div>
+    <div id="tFormBuy" style="display:none">
+      <div class="field"><label>Где купить</label><input id="tBuyPlace" placeholder="Moba / Master Mobile / MEMS"></div>
+      <div class="field">
+        <label>Список запчастей и цены</label>
+        <div id="tBuyRows" style="display:flex;flex-direction:column;gap:6px"></div>
+        <button type="button" class="btn btn-dark btn-sm" style="margin-top:6px" onclick="addBuyRow()">+ Добавить товар и цену</button>
+      </div>
+    </div>
+    <div class="field">
+      <label>Кому задача (1 или несколько)</label>
+      <div style="display:flex;flex-direction:column;gap:5px">${peopleChecks}</div>
+    </div>
+    <div class="field">
+      <label>Интервал напоминаний в боте</label>
+      <select id="tInterval">
+        <option value="30">Каждые 30 минут</option>
+        <option value="60" selected>Каждый 1 час</option>
+        <option value="90">Каждые 1,5 часа</option>
+        <option value="120">Каждые 2 часа</option>
+        <option value="0">Без повторов (1 раз)</option>
+      </select>
+    </div>
+    <div class="modal-btns">
+      <button class="btn btn-dark" onclick="closeModal()">Отмена</button>
+      <button class="btn btn-orange" onclick="submitNewTask()">Поставить задачу</button>
+    </div>
+  `);
+  addBuyRow();
+}
+function switchTaskFormType() {
+  const v = document.getElementById('tType').value;
+  document.getElementById('tFormShip').style.display = v === 'ship' ? '' : 'none';
+  document.getElementById('tFormHand').style.display = v === 'handover' ? '' : 'none';
+  document.getElementById('tFormBuy').style.display = v === 'buy' ? '' : 'none';
+}
+function addBuyRow() {
+  const wrap = document.getElementById('tBuyRows');
+  const row = document.createElement('div');
+  row.style.cssText = 'display:flex;gap:6px';
+  row.innerHTML = '<input class="t-buy-name" placeholder="Товар / запчасть" style="flex:2"><input class="t-buy-price" placeholder="Цена ₽" style="flex:1">';
+  wrap.appendChild(row);
+}
+async function submitNewTask() {
+  const task_type = document.getElementById('tType').value;
+  const assignees = Array.from(document.querySelectorAll('.t-ass-chk:checked')).map(c => c.value);
+  if (!assignees.length) { toast('Выберите хотя бы одного исполнителя'); return; }
+  const interval_minutes = Number(document.getElementById('tInterval').value || 60);
+  let payload = {};
+  let photo_b64 = '';
+  if (task_type === 'ship') {
+    payload = {
+      pickup: document.getElementById('tPickup').value.trim(),
+      item: document.getElementById('tShipItem').value.trim(),
+      location: document.getElementById('tShipLoc').value.trim(),
+    };
+    const f = document.getElementById('tShipPhoto').files[0];
+    if (f) photo_b64 = await compressImage(f, 800, 0.75);
+  } else if (task_type === 'handover') {
+    payload = {
+      time: document.getElementById('tHandTime').value.trim(),
+      item: document.getElementById('tHandItem').value.trim(),
+      location: document.getElementById('tHandLoc').value.trim(),
+    };
+  } else {
+    const names = Array.from(document.querySelectorAll('.t-buy-name'));
+    const prices = Array.from(document.querySelectorAll('.t-buy-price'));
+    const items = names.map((n, i) => ({ name: n.value.trim(), price: prices[i].value.trim() })).filter(x => x.name);
+    payload = { place: document.getElementById('tBuyPlace').value.trim(), items };
+  }
+  await api('/api/service/tasks', 'POST', { task_type, payload, assignees, interval_minutes, photo_b64 });
+  closeModal(); toast('Задача поставлена!'); loadAll();
+}
+async function markTaskDoneWeb(id) {
+  await api('/api/service/tasks/' + id + '/done', 'POST');
+  toast('Задача выполнена!'); loadAll();
+}
+async function delTaskWeb(id) {
+  if (!confirm('Удалить задачу?')) return;
+  await api('/api/service/tasks/' + id, 'DELETE');
+  toast('Удалено'); loadAll();
 }
 
 async function runImeiCheck() {
@@ -1594,6 +1755,11 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
             "unsold_my": unsold_my[:25],
             "repair_prices": [dict(r) for r in deps["get_repair_prices"]()] if perms["can_parts_search"] else [],
             "repair_orders": [dict(o) for o in deps["get_repair_orders"]()] if perms["can_repair_crm"] else [],
+            "tasks": [
+                {**t, "photo_url": (f"/api/photo/{t['photo_ref']}" if (t.get("photo_ref") or "").startswith("web_") else "")}
+                for t in deps["get_tasks"](None, None if is_owner else sess["user_hash"])
+            ] if (perms["can_parts_search"] or perms["can_repair_crm"]) else [],
+            "assignable_people": deps["get_assignable_people"]() if (perms["can_parts_search"] or perms["can_repair_crm"]) else [],
         })
 
     # --- Посты ---
@@ -1883,7 +2049,56 @@ def create_web_app(bot: Bot, deps: dict[str, Callable[..., Any]]) -> web.Applica
 
     app.router.add_get("/api/repair/search", handle_repair_search)
     app.router.add_post("/api/service/imei", handle_srv_imei)
+    async def handle_create_task(request: web.Request) -> web.Response:
+        if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        body = await request.json()
+        ttype = str(body.get("task_type", "ship"))
+        payload = body.get("payload") or {}
+        if ttype == "buy":
+            for it in payload.get("items") or []:
+                it["price"] = deps["parse_amount"](str(it.get("price", "0")))
+            title = f"{payload.get('place', '')} ({len(payload.get('items', []))} поз.)"
+        elif ttype == "handover":
+            title = f"{payload.get('time', '')} • {payload.get('item', '')}"
+        else:
+            title = f"{payload.get('pickup', '')} • {payload.get('item', '')}"
+        photo_ref = ""
+        b64 = str(body.get("photo_b64") or "")
+        if b64 and "," in b64:
+            raw = base64.b64decode(b64.split(",", 1)[1])
+            fname = f"web_task_{secrets.token_hex(8)}.jpg"
+            with open(os.path.join(WEB_PHOTOS_DIR, fname), "wb") as pf:
+                pf.write(raw)
+            photo_ref = fname
+        tid = deps["create_task"](
+            task_type=ttype,
+            title=title,
+            payload=payload,
+            assignees=list(body.get("assignees") or []),
+            interval_minutes=int(body.get("interval_minutes") or 60),
+            created_by=request["session"]["user_hash"],
+            photo_ref=photo_ref,
+        )
+        await deps["send_task_notification"](bot, tid, is_reminder=False)
+        return web.json_response({"id": tid})
+
+    async def handle_done_task(request: web.Request) -> web.Response:
+        if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["mark_task_done"](int(request.match_info["id"]))
+        return web.json_response({"ok": True})
+
+    async def handle_del_task(request: web.Request) -> web.Response:
+        if not (_has_perm(request, "can_parts_search") or _has_perm(request, "can_repair_crm")):
+            return web.json_response({"error": "Forbidden"}, status=403)
+        deps["delete_task"](int(request.match_info["id"]))
+        return web.json_response({"ok": True})
+
     app.router.add_post("/api/service/panic", handle_srv_panic)
+    app.router.add_post("/api/service/tasks", handle_create_task)
+    app.router.add_post("/api/service/tasks/{id}/done", handle_done_task)
+    app.router.add_delete("/api/service/tasks/{id}", handle_del_task)
     app.router.add_post("/api/repair/prices", handle_add_rep_price)
     app.router.add_put("/api/repair/prices/{id}", handle_upd_rep_price)
     app.router.add_delete("/api/repair/prices/{id}", handle_del_rep_price)

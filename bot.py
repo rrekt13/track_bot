@@ -7,13 +7,14 @@ import logging
 import os
 import re
 import sqlite3
+import time
 from contextlib import closing
 from html import escape as h
 from acts import generate_act_pdf
 from devices_catalog import search_devices
 from repair import match_work_price, search_parts_all
 from service_tools import analyze_panic_log, check_imei_info, extract_imei_highlights
-from typing import Optional
+from typing import Any, Optional
 
 from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
@@ -352,6 +353,28 @@ def init_db() -> None:
             conn.execute("ALTER TABLE personal_entries ADD COLUMN condition TEXT DEFAULT ''")
         if "photo_ref" not in pe_cols:
             conn.execute("ALTER TABLE personal_entries ADD COLUMN photo_ref TEXT DEFAULT ''")
+
+        if "tg_id" not in admin_cols:
+            conn.execute("ALTER TABLE admins ADD COLUMN tg_id INTEGER NOT NULL DEFAULT 0")
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                task_type TEXT NOT NULL,
+                title TEXT NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                photo_ref TEXT DEFAULT '',
+                assignees_json TEXT NOT NULL DEFAULT '[]',
+                interval_minutes INTEGER NOT NULL DEFAULT 60,
+                status TEXT NOT NULL DEFAULT 'active',
+                created_by TEXT NOT NULL DEFAULT '',
+                last_reminded_at INTEGER NOT NULL DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                done_at TIMESTAMP DEFAULT NULL
+            );
+            """
+        )
 
         if ENV_ADMIN_ID.isdigit():
             conn.execute(
@@ -1040,6 +1063,195 @@ def delete_repair_order(order_id: int) -> None:
         conn.commit()
 
 
+# --- Задачи и напоминания ---
+
+def get_assignable_people() -> list[dict[str, Any]]:
+    people: list[dict[str, Any]] = [{
+        "user_hash": get_owner_hash() or "owner",
+        "label": "Я (Владелец)",
+        "tg_id": get_owner_tg_id(),
+    }]
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        for r in conn.execute("SELECT user_hash, label, tg_id FROM admins ORDER BY id ASC").fetchall():
+            people.append({"user_hash": r["user_hash"], "label": r["label"], "tg_id": int(r["tg_id"] or 0)})
+    return people
+
+
+def create_task(
+    task_type: str,
+    title: str,
+    payload: dict[str, Any],
+    assignees: list[str],
+    interval_minutes: int,
+    created_by: str,
+    photo_ref: str = "",
+) -> int:
+    now_ts = int(time.time())
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        cur = conn.execute(
+            """
+            INSERT INTO tasks (task_type, title, payload_json, photo_ref, assignees_json, interval_minutes, status, created_by, last_reminded_at)
+            VALUES (?, ?, ?, ?, ?, ?, 'active', ?, ?)
+            """,
+            (
+                task_type,
+                title.strip(),
+                json.dumps(payload, ensure_ascii=False),
+                photo_ref.strip(),
+                json.dumps(assignees, ensure_ascii=False),
+                max(0, int(interval_minutes)),
+                created_by,
+                now_ts,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
+
+
+def get_tasks(status: Optional[str] = None, user_hash: Optional[str] = None) -> list[dict[str, Any]]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        if status:
+            rows = conn.execute("SELECT * FROM tasks WHERE status = ? ORDER BY id DESC LIMIT 40", (status,)).fetchall()
+        else:
+            rows = conn.execute("SELECT * FROM tasks ORDER BY CASE WHEN status='active' THEN 0 ELSE 1 END, id DESC LIMIT 40").fetchall()
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        d = dict(r)
+        try:
+            d["payload"] = json.loads(d.get("payload_json") or "{}")
+        except Exception:
+            d["payload"] = {}
+        try:
+            d["assignees"] = json.loads(d.get("assignees_json") or "[]")
+        except Exception:
+            d["assignees"] = []
+        if user_hash and user_hash not in d["assignees"] and d.get("created_by") != user_hash:
+            continue
+        out.append(d)
+    return out
+
+
+def get_task_by_id(task_id: int) -> Optional[dict[str, Any]]:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        r = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if not r:
+        return None
+    d = dict(r)
+    try:
+        d["payload"] = json.loads(d.get("payload_json") or "{}")
+    except Exception:
+        d["payload"] = {}
+    try:
+        d["assignees"] = json.loads(d.get("assignees_json") or "[]")
+    except Exception:
+        d["assignees"] = []
+    return d
+
+
+def mark_task_done(task_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("UPDATE tasks SET status = 'done', done_at = CURRENT_TIMESTAMP WHERE id = ?", (task_id,))
+        conn.commit()
+
+
+def delete_task(task_id: int) -> None:
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        conn.commit()
+
+
+def format_task_html(t: dict[str, Any], is_reminder: bool = False) -> str:
+    p = t.get("payload") or {}
+    ttype = t.get("task_type")
+    hdr = "🔔 <b>НАПОМИНАНИЕ ПО ЗАДАЧЕ</b>" if is_reminder else "📋 <b>НОВАЯ ЗАДАЧА</b>"
+    num = str(t["id"]).zfill(3)
+    if ttype == "ship":
+        body = (
+            f"📦 <b>Отправить товар клиенту</b> (#{num})\n"
+            f"• <b>Пункт выдачи:</b> {h(p.get('pickup', '—'))}\n"
+            f"• <b>Товар:</b> {h(p.get('item', '—'))}\n"
+            f"• <b>Комплектация и где лежит:</b> {h(p.get('location', '—'))}"
+        )
+    elif ttype == "handover":
+        body = (
+            f"🤝 <b>Передать товар клиенту</b> (#{num})\n"
+            f"• <b>Время:</b> {h(p.get('time', '—'))}\n"
+            f"• <b>Товар:</b> {h(p.get('item', '—'))}\n"
+            f"• <b>Комплектация и где лежит:</b> {h(p.get('location', '—'))}"
+        )
+    else:
+        items = p.get("items") or []
+        tot = sum(float(x.get("price") or 0) for x in items)
+        lines = [f"  {i}. {h(x.get('name',''))} — <b>{fmt_money(x.get('price',0))}</b>" for i, x in enumerate(items, 1)]
+        body = (
+            f"🛒 <b>Купить запчасти</b> (#{num})\n"
+            f"• <b>Где купить:</b> {h(p.get('place', '—'))}\n"
+            + ("\n".join(lines) if lines else "• Список пуст")
+            + f"\n• <b>Итого:</b> {fmt_money(tot)}"
+        )
+    iv = int(t.get("interval_minutes") or 0)
+    iv_txt = f"каждые {iv} мин." if iv > 0 else "без повторов"
+    return f"{hdr}\n\n{body}\n\n⏱ <i>Напоминания: {iv_txt}</i>"
+
+
+async def send_task_notification(bot: Bot, task_id: int, is_reminder: bool = False) -> None:
+    t = get_task_by_id(task_id)
+    if not t or t["status"] != "active":
+        return
+    people = {p["user_hash"]: p["tg_id"] for p in get_assignable_people()}
+    owner_id = get_owner_tg_id()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Задача выполнена", callback_data=f"task_done:{task_id}")]])
+    txt = format_task_html(t, is_reminder=is_reminder)
+    pref = t.get("photo_ref") or ""
+    targets: set[int] = set()
+    for uh in t.get("assignees", []):
+        if uh in ("owner", get_owner_hash()):
+            if owner_id:
+                targets.add(owner_id)
+        elif people.get(uh):
+            targets.add(int(people[uh]))
+    for chat_id in targets:
+        try:
+            if pref:
+                if pref.startswith("web_"):
+                    fpath = os.path.join(os.path.dirname(DB_PATH) or ".", "web_photos", pref)
+                    if os.path.isfile(fpath):
+                        with open(fpath, "rb") as pf:
+                            await bot.send_photo(chat_id=chat_id, photo=BufferedInputFile(pf.read(), filename=pref), caption=txt, reply_markup=kb)
+                        continue
+                else:
+                    await bot.send_photo(chat_id=chat_id, photo=pref, caption=txt, reply_markup=kb)
+                    continue
+            await bot.send_message(chat_id=chat_id, text=txt, reply_markup=kb)
+        except Exception as e:
+            logger.warning(f"Task {task_id} notify error for {chat_id}: {e}")
+
+
+async def _tasks_reminder_loop(bot: Bot) -> None:
+    while True:
+        try:
+            await asyncio.sleep(45)
+            now_ts = int(time.time())
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.row_factory = sqlite3.Row
+                due = conn.execute(
+                    "SELECT id, interval_minutes, last_reminded_at FROM tasks WHERE status = 'active' AND interval_minutes > 0"
+                ).fetchall()
+            for r in due:
+                if now_ts - int(r["last_reminded_at"] or 0) >= int(r["interval_minutes"]) * 60:
+                    with closing(sqlite3.connect(DB_PATH)) as conn:
+                        conn.execute("UPDATE tasks SET last_reminded_at = ? WHERE id = ?", (now_ts, r["id"]))
+                        conn.commit()
+                    await send_task_notification(bot, r["id"], is_reminder=True)
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(f"Tasks reminder loop error: {e}")
+
+
 # ---------------------------------------------------------------------------
 # Middleware проверки доступа
 # ---------------------------------------------------------------------------
@@ -1053,6 +1265,13 @@ class AccessMiddleware(BaseMiddleware):
             set_owner_if_empty(user.id)
         if not is_admin(user.id):
             return
+        if is_main_admin(user.id):
+            if not get_setting("owner_tg_id"):
+                set_setting("owner_tg_id", str(user.id))
+        else:
+            with closing(sqlite3.connect(DB_PATH)) as conn:
+                conn.execute("UPDATE admins SET tg_id = ? WHERE user_hash = ? AND tg_id = 0", (user.id, hash_user_id(user.id)))
+                conn.commit()
         return await handler(event, data)
 
 
@@ -1088,6 +1307,21 @@ class PostFSM(StatesGroup):
 class ServiceFSM(StatesGroup):
     waiting_imei = State()
     waiting_panic = State()
+
+
+class TaskFSM(StatesGroup):
+    waiting_ship_pickup = State()
+    waiting_ship_item = State()
+    waiting_ship_loc = State()
+    waiting_ship_photo = State()
+    waiting_hand_time = State()
+    waiting_hand_item = State()
+    waiting_hand_loc = State()
+    waiting_buy_place = State()
+    waiting_buy_item_name = State()
+    waiting_buy_item_price = State()
+    waiting_assignees = State()
+    waiting_interval = State()
 
 
 class RepairFSM(StatesGroup):
@@ -1722,6 +1956,7 @@ def service_menu_kb(user_id: int) -> InlineKeyboardMarkup:
     if has_perm(user_id, "can_parts_search") or has_perm(user_id, "can_repair_crm"):
         rows.append([InlineKeyboardButton(text="📱 Проверка IMEI / iCloud", callback_data="srv_imei")])
         rows.append([InlineKeyboardButton(text="🩺 Разбор Panic-логов", callback_data="srv_panic")])
+        rows.append([InlineKeyboardButton(text="📋 Задачи", callback_data="tasks_menu")])
     rows.append([InlineKeyboardButton(text="🏠 В главное меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1876,6 +2111,336 @@ async def msg_srv_panic_text(message: Message, state: FSMContext) -> None:
         return
     await state.clear()
     await _reply_panic_analysis(message, message.text)
+
+
+# --- Задачи в боте ---
+
+def tasks_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Новая задача", callback_data="task_new")],
+            [InlineKeyboardButton(text="📋 Активные задачи", callback_data="task_list:active")],
+            [InlineKeyboardButton(text="✅ Выполненные", callback_data="task_list:done")],
+            [InlineKeyboardButton(text="⬅️ В меню Сервис", callback_data="service_menu")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "tasks_menu")
+async def cb_tasks_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
+        return
+    await state.clear()
+    uh = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
+    cnt = len(get_tasks("active", uh))
+    await safe_edit_or_send(
+        callback.message,
+        f"📋 <b>Задачи и напоминания</b>\nАктивных задач: <b>{cnt}</b>",
+        reply_markup=tasks_menu_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_list:"))
+async def cb_task_list(callback: CallbackQuery) -> None:
+    if not (has_perm(callback.from_user.id, "can_parts_search") or has_perm(callback.from_user.id, "can_repair_crm")):
+        return
+    st = callback.data.split(":", 1)[1]
+    uh = None if is_main_admin(callback.from_user.id) else hash_user_id(callback.from_user.id)
+    items = get_tasks(st, uh)
+    rows = []
+    if not items:
+        txt = "📋 Список пуст."
+    else:
+        txt = f"📋 <b>{'Активные' if st == 'active' else 'Выполненные'} задачи:</b>"
+        for t in items[:15]:
+            ico = "📦" if t["task_type"] == "ship" else ("🤝" if t["task_type"] == "handover" else "🛒")
+            rows.append([InlineKeyboardButton(text=f"{ico} #{str(t['id']).zfill(3)} • {t['title'][:38]}", callback_data=f"task_view:{t['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="tasks_menu")])
+    await safe_edit_or_send(callback.message, txt, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_view:"))
+async def cb_task_view(callback: CallbackQuery) -> None:
+    t = get_task_by_id(int(callback.data.split(":")[1]))
+    if not t:
+        await callback.answer("Задача не найдена", show_alert=True)
+        return
+    rows = []
+    if t["status"] == "active":
+        rows.append([InlineKeyboardButton(text="✅ Задача выполнена", callback_data=f"task_done:{t['id']}")])
+    rows.append([InlineKeyboardButton(text="🗑 Удалить", callback_data=f"task_del:{t['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ К задачам", callback_data="tasks_menu")])
+    await safe_edit_or_send(callback.message, format_task_html(t), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_done:"))
+async def cb_task_done(callback: CallbackQuery) -> None:
+    tid = int(callback.data.split(":")[1])
+    mark_task_done(tid)
+    await callback.answer("Задача выполнена! Напоминания остановлены.", show_alert=True)
+    if callback.message.text:
+        try:
+            await callback.message.edit_text(f"✅ <b>Задача #{str(tid).zfill(3)} выполнена!</b>", reply_markup=tasks_menu_kb())
+            return
+        except Exception:
+            pass
+    await callback.message.answer(f"✅ <b>Задача #{str(tid).zfill(3)} выполнена!</b>", reply_markup=tasks_menu_kb())
+
+
+@router.callback_query(F.data.startswith("task_del:"))
+async def cb_task_del(callback: CallbackQuery) -> None:
+    delete_task(int(callback.data.split(":")[1]))
+    await callback.answer("Удалено")
+    await cb_tasks_menu(callback, FSMContext) if False else await safe_edit_or_send(callback.message, "🗑 Задача удалена.", reply_markup=tasks_menu_kb())
+
+
+@router.callback_query(F.data == "task_new")
+async def cb_task_new(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Отправить товар клиенту", callback_data="task_type:ship")],
+            [InlineKeyboardButton(text="🤝 Передать товар клиенту", callback_data="task_type:handover")],
+            [InlineKeyboardButton(text="🛒 Купить запчасти", callback_data="task_type:buy")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
+        ]
+    )
+    await safe_edit_or_send(callback.message, "➕ <b>Выберите тип задачи:</b>", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("task_type:"))
+async def cb_task_type(callback: CallbackQuery, state: FSMContext) -> None:
+    ttype = callback.data.split(":", 1)[1]
+    await state.update_data(task_type=ttype, payload={}, photo_ref="", assignees=[])
+    if ttype == "ship":
+        await state.set_state(TaskFSM.waiting_ship_pickup)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Яндекс", callback_data="t_pick:Яндекс"), InlineKeyboardButton(text="СДЭК", callback_data="t_pick:СДЭК")],
+                [InlineKeyboardButton(text="Авито", callback_data="t_pick:Авито"), InlineKeyboardButton(text="Почта России", callback_data="t_pick:Почта России")],
+                [InlineKeyboardButton(text="5Post", callback_data="t_pick:5Post")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
+            ]
+        )
+        await safe_edit_or_send(callback.message, "📦 <b>Какой пункт выдачи / доставка?</b>\nВыберите или напишите свой вариант:", reply_markup=kb)
+    elif ttype == "handover":
+        await state.set_state(TaskFSM.waiting_hand_time)
+        await safe_edit_or_send(callback.message, "🤝 <b>В какое время будет клиент?</b> (напр. <code>16:30</code> или <code>до 19:00</code>):")
+    else:
+        await state.set_state(TaskFSM.waiting_buy_place)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Moba", callback_data="t_place:Moba"), InlineKeyboardButton(text="Master Mobile", callback_data="t_place:Master Mobile")],
+                [InlineKeyboardButton(text="MEMS", callback_data="t_place:MEMS")],
+                [InlineKeyboardButton(text="❌ Отмена", callback_data="tasks_menu")],
+            ]
+        )
+        await safe_edit_or_send(callback.message, "🛒 <b>Где нужно купить запчасти?</b>\nВыберите или напишите место:", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(TaskFSM.waiting_ship_pickup, F.data.startswith("t_pick:"))
+async def cb_t_pick(callback: CallbackQuery, state: FSMContext) -> None:
+    val = callback.data.split(":", 1)[1]
+    await state.update_data(payload={"pickup": val})
+    await state.set_state(TaskFSM.waiting_ship_item)
+    await callback.message.answer(f"Пункт: <b>{h(val)}</b>\n\n📦 <b>Какой товар отправляем?</b>")
+    await callback.answer()
+
+
+@router.message(TaskFSM.waiting_ship_pickup, F.text)
+async def msg_t_pick(message: Message, state: FSMContext) -> None:
+    await state.update_data(payload={"pickup": message.text.strip()})
+    await state.set_state(TaskFSM.waiting_ship_item)
+    await message.answer("📦 <b>Какой товар отправляем?</b>")
+
+
+@router.message(TaskFSM.waiting_ship_item, F.text)
+async def msg_t_sitem(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = data["payload"]
+    p["item"] = message.text.strip()
+    await state.update_data(payload=p)
+    await state.set_state(TaskFSM.waiting_ship_loc)
+    await message.answer("📍 <b>Какая комплектация и где лежит?</b>")
+
+
+@router.message(TaskFSM.waiting_ship_loc, F.text)
+async def msg_t_sloc(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = data["payload"]
+    p["location"] = message.text.strip()
+    await state.update_data(payload=p)
+    await state.set_state(TaskFSM.waiting_ship_photo)
+    await message.answer("🖼 Отправьте <b>фото штрих-кода</b> отправки (или отправьте <code>-</code>, если без фото):")
+
+
+@router.message(TaskFSM.waiting_ship_photo, F.photo)
+async def msg_t_sphoto(message: Message, state: FSMContext) -> None:
+    await state.update_data(photo_ref=message.photo[-1].file_id)
+    await _ask_task_assignees(message, state)
+
+
+@router.message(TaskFSM.waiting_ship_photo, F.text)
+async def msg_t_sphoto_skip(message: Message, state: FSMContext) -> None:
+    await state.update_data(photo_ref="")
+    await _ask_task_assignees(message, state)
+
+
+@router.message(TaskFSM.waiting_hand_time, F.text)
+async def msg_t_htime(message: Message, state: FSMContext) -> None:
+    await state.update_data(payload={"time": message.text.strip()})
+    await state.set_state(TaskFSM.waiting_hand_item)
+    await message.answer("🤝 <b>Какой товар передаём клиенту?</b>")
+
+
+@router.message(TaskFSM.waiting_hand_item, F.text)
+async def msg_t_hitem(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = data["payload"]
+    p["item"] = message.text.strip()
+    await state.update_data(payload=p)
+    await state.set_state(TaskFSM.waiting_hand_loc)
+    await message.answer("📍 <b>Какая комплектация и где лежит?</b>")
+
+
+@router.message(TaskFSM.waiting_hand_loc, F.text)
+async def msg_t_hloc(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = data["payload"]
+    p["location"] = message.text.strip()
+    await state.update_data(payload=p)
+    await _ask_task_assignees(message, state)
+
+
+@router.callback_query(TaskFSM.waiting_buy_place, F.data.startswith("t_place:"))
+async def cb_t_place(callback: CallbackQuery, state: FSMContext) -> None:
+    val = callback.data.split(":", 1)[1]
+    await state.update_data(payload={"place": val, "items": []})
+    await state.set_state(TaskFSM.waiting_buy_item_name)
+    await callback.message.answer(f"Место: <b>{h(val)}</b>\n\n🛒 <b>Что нужно купить?</b> (название товара 1):")
+    await callback.answer()
+
+
+@router.message(TaskFSM.waiting_buy_place, F.text)
+async def msg_t_place(message: Message, state: FSMContext) -> None:
+    await state.update_data(payload={"place": message.text.strip(), "items": []})
+    await state.set_state(TaskFSM.waiting_buy_item_name)
+    await message.answer("🛒 <b>Что нужно купить?</b> (название товара 1):")
+
+
+@router.message(TaskFSM.waiting_buy_item_name, F.text)
+async def msg_t_bname(message: Message, state: FSMContext) -> None:
+    await state.update_data(cur_buy_name=message.text.strip())
+    await state.set_state(TaskFSM.waiting_buy_item_price)
+    await message.answer("💰 <b>Укажите цену для этой позиции (₽):</b>")
+
+
+@router.message(TaskFSM.waiting_buy_item_price, F.text)
+async def msg_t_bprice(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    p = data["payload"]
+    p.setdefault("items", []).append({"name": data["cur_buy_name"], "price": parse_amount(message.text)})
+    await state.update_data(payload=p)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="➕ Добавить ещё товар", callback_data="t_buy_more")],
+            [InlineKeyboardButton(text="➡️ Далее (кому задача)", callback_data="t_buy_done")],
+        ]
+    )
+    await message.answer(f"✅ Добавлено! Всего позиций: <b>{len(p['items'])}</b>", reply_markup=kb)
+
+
+@router.callback_query(F.data == "t_buy_more")
+async def cb_t_buy_more(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TaskFSM.waiting_buy_item_name)
+    await callback.message.answer("🛒 <b>Название следующего товара:</b>")
+    await callback.answer()
+
+
+@router.callback_query(F.data == "t_buy_done")
+async def cb_t_buy_done(callback: CallbackQuery, state: FSMContext) -> None:
+    await _ask_task_assignees(callback.message, state)
+    await callback.answer()
+
+
+def _assignees_kb(selected: list[str]) -> InlineKeyboardMarkup:
+    rows = []
+    for p in get_assignable_people():
+        uh = p["user_hash"]
+        mark = "✅" if uh in selected else "☑️"
+        rows.append([InlineKeyboardButton(text=f"{mark} {p['label']}", callback_data=f"t_ass:{uh[:16]}")])
+    if selected:
+        rows.append([InlineKeyboardButton(text="➡️ Выбрать интервал", callback_data="t_ass_next")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _ask_task_assignees(msg: Message, state: FSMContext) -> None:
+    await state.set_state(TaskFSM.waiting_assignees)
+    await msg.answer("👥 <b>Кому поставить задачу?</b> (можно выбрать 1 или несколько):", reply_markup=_assignees_kb([]))
+
+
+@router.callback_query(TaskFSM.waiting_assignees, F.data.startswith("t_ass:"))
+async def cb_t_ass(callback: CallbackQuery, state: FSMContext) -> None:
+    pref = callback.data.split(":", 1)[1]
+    data = await state.get_data()
+    sel = list(data.get("assignees") or [])
+    full = next((p["user_hash"] for p in get_assignable_people() if p["user_hash"].startswith(pref)), None)
+    if full:
+        if full in sel:
+            sel.remove(full)
+        else:
+            sel.append(full)
+        await state.update_data(assignees=sel)
+        await callback.message.edit_reply_markup(reply_markup=_assignees_kb(sel))
+    await callback.answer()
+
+
+@router.callback_query(TaskFSM.waiting_assignees, F.data == "t_ass_next")
+async def cb_t_ass_next(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(TaskFSM.waiting_interval)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏱ Каждые 30 минут", callback_data="t_iv:30")],
+            [InlineKeyboardButton(text="⏱ Каждый 1 час", callback_data="t_iv:60")],
+            [InlineKeyboardButton(text="⏱ Каждые 1,5 часа", callback_data="t_iv:90")],
+            [InlineKeyboardButton(text="⏱ Каждые 2 часа", callback_data="t_iv:120")],
+            [InlineKeyboardButton(text="🔔 Без повторов (1 раз)", callback_data="t_iv:0")],
+        ]
+    )
+    await callback.message.edit_text("⏱ <b>Как часто бот должен напоминать о задаче в чате?</b>", reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(TaskFSM.waiting_interval, F.data.startswith("t_iv:"))
+async def cb_t_iv(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    iv = int(callback.data.split(":", 1)[1])
+    data = await state.get_data()
+    ttype = data["task_type"]
+    p = data["payload"]
+    if ttype == "ship":
+        title = f"{p.get('pickup','')} • {p.get('item','')}"
+    elif ttype == "handover":
+        title = f"{p.get('time','')} • {p.get('item','')}"
+    else:
+        title = f"{p.get('place','')} ({len(p.get('items',[]))} поз.)"
+    tid = create_task(
+        task_type=ttype,
+        title=title,
+        payload=p,
+        assignees=data.get("assignees") or [],
+        interval_minutes=iv,
+        created_by=hash_user_id(callback.from_user.id),
+        photo_ref=data.get("photo_ref") or "",
+    )
+    await state.clear()
+    await send_task_notification(bot, tid, is_reminder=False)
+    await callback.message.edit_text(f"✅ <b>Задача #{str(tid).zfill(3)} создана и отправлена!</b>", reply_markup=tasks_menu_kb())
+    await callback.answer("Создано!")
 
 
 @router.callback_query(F.data == "parts_menu")
@@ -3490,6 +4055,12 @@ async def main() -> None:
         "match_work_price": match_work_price,
         "check_imei_info": check_imei_info,
         "analyze_panic_log": analyze_panic_log,
+        "get_assignable_people": get_assignable_people,
+        "create_task": create_task,
+        "get_tasks": get_tasks,
+        "mark_task_done": mark_task_done,
+        "delete_task": delete_task,
+        "send_task_notification": send_task_notification,
         "get_personal_stats_by_hash": get_personal_stats_by_hash,
         "get_personal_entries_by_hash": get_personal_entries_by_hash,
         "add_personal_entry_by_hash": add_personal_entry_by_hash,
@@ -3521,9 +4092,11 @@ async def main() -> None:
         "build_sold_text_and_entities": build_sold_text_and_entities,
     }
     runner = await start_web_server(bot, web_deps)
+    rem_task = asyncio.create_task(_tasks_reminder_loop(bot))
     try:
         await dp.start_polling(bot)
     finally:
+        rem_task.cancel()
         await runner.cleanup()
 
 
